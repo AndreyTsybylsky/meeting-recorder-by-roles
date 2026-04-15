@@ -1,0 +1,8 @@
+# OS generated files
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Chrome extension local data (if any)
+*.log
+*.tmp
