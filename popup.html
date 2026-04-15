@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Meet Transcriber — Сессии</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      width: 380px;
+      min-height: 200px;
+      max-height: 520px;
+      overflow-y: auto;
+      background: #0f0f19;
+      color: #e2e8f0;
+      font-family: 'Inter', sans-serif;
+      font-size: 13px;
+    }
+
+    body::-webkit-scrollbar { width: 4px; }
+    body::-webkit-scrollbar-thumb { background: rgba(255,255,255,.12); border-radius: 4px; }
+
+    .header {
+      padding: 16px 20px;
+      border-bottom: 1px solid rgba(255,255,255,.06);
+      position: sticky;
+      top: 0;
+      background: rgba(15,15,25,.96);
+      backdrop-filter: blur(12px);
+      z-index: 10;
+    }
+
+    .header h1 {
+      font-size: 15px;
+      font-weight: 700;
+      background: linear-gradient(135deg, #c7d2fe, #a78bfa);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    .header p {
+      margin-top: 4px;
+      font-size: 11px;
+      color: #64748b;
+    }
+
+    .empty {
+      padding: 48px 20px;
+      text-align: center;
+      color: #475569;
+      font-size: 13px;
+    }
+    .empty .icon {
+      font-size: 36px;
+      margin-bottom: 12px;
+    }
+
+    .session-list {
+      padding: 8px 12px 12px;
+    }
+
+    .session-card {
+      background: rgba(255,255,255,.04);
+      border: 1px solid rgba(255,255,255,.06);
+      border-radius: 12px;
+      padding: 14px 16px;
+      margin-bottom: 10px;
+      transition: background .15s ease;
+    }
+    .session-card:hover {
+      background: rgba(255,255,255,.07);
+    }
+
+    .session-meta {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      margin-bottom: 6px;
+    }
+
+    .session-title {
+      font-size: 13px;
+      font-weight: 600;
+      color: #e2e8f0;
+      word-break: break-all;
+    }
+
+    .session-date {
+      font-size: 11px;
+      color: #64748b;
+      margin-top: 2px;
+    }
+
+    .session-stats {
+      font-size: 11px;
+      color: #94a3b8;
+      margin-bottom: 10px;
+    }
+
+    .session-actions {
+      display: flex;
+      gap: 8px;
+    }
+
+    .btn {
+      padding: 6px 12px;
+      border: none;
+      border-radius: 8px;
+      font-family: 'Inter', sans-serif;
+      font-size: 11px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all .15s ease;
+      outline: none;
+    }
+
+    .btn-download {
+      background: linear-gradient(135deg, #6366f1, #8b5cf6);
+      color: #fff;
+    }
+    .btn-download:hover { filter: brightness(1.15); }
+
+    .btn-preview {
+      background: rgba(255,255,255,.06);
+      color: #cbd5e1;
+      border: 1px solid rgba(255,255,255,.08);
+    }
+    .btn-preview:hover { background: rgba(255,255,255,.1); }
+
+    .btn-delete {
+      background: rgba(239,68,68,.1);
+      color: #f87171;
+      border: 1px solid rgba(239,68,68,.15);
+      margin-left: auto;
+    }
+    .btn-delete:hover { background: rgba(239,68,68,.2); }
+
+    /* Preview modal */
+    .preview-overlay {
+      display: none;
+      position: fixed;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background: rgba(0,0,0,.85);
+      z-index: 100;
+      flex-direction: column;
+    }
+    .preview-overlay.show { display: flex; }
+
+    .preview-header {
+      padding: 14px 20px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border-bottom: 1px solid rgba(255,255,255,.06);
+    }
+    .preview-header h3 {
+      font-size: 13px;
+      font-weight: 600;
+      color: #a78bfa;
+    }
+
+    .preview-close {
+      background: none;
+      border: none;
+      color: #94a3b8;
+      font-size: 18px;
+      cursor: pointer;
+      padding: 4px 8px;
+      border-radius: 6px;
+    }
+    .preview-close:hover { background: rgba(255,255,255,.08); color: #fff; }
+
+    .preview-body {
+      flex: 1;
+      overflow-y: auto;
+      padding: 16px 20px;
+      font-size: 12px;
+      line-height: 1.6;
+    }
+    .preview-body::-webkit-scrollbar { width: 4px; }
+    .preview-body::-webkit-scrollbar-thumb { background: rgba(255,255,255,.12); border-radius: 4px; }
+
+    .preview-speaker {
+      font-size: 11px;
+      font-weight: 600;
+      color: #a78bfa;
+      margin-top: 12px;
+      margin-bottom: 2px;
+    }
+    .preview-speaker:first-child { margin-top: 0; }
+
+    .preview-text {
+      color: #cbd5e1;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>📝 Meet Transcriber</h1>
+    <p>История записей</p>
+  </div>
+
+  <div id="content"></div>
+
+  <div class="preview-overlay" id="previewOverlay">
+    <div class="preview-header">
+      <h3 id="previewTitle">Предпросмотр</h3>
+      <button class="preview-close" id="previewClose">✕</button>
+    </div>
+    <div class="preview-body" id="previewBody"></div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
