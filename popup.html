@@ -138,6 +138,138 @@
     }
     .btn-delete:hover { background: rgba(239,68,68,.2); }
 
+    .btn-email {
+      background: rgba(34,197,94,.1);
+      color: #4ade80;
+      border: 1px solid rgba(34,197,94,.15);
+    }
+    .btn-email:hover { background: rgba(34,197,94,.2); }
+
+    /* Email modal */
+    .email-overlay {
+      display: none;
+      position: fixed;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background: rgba(0,0,0,.85);
+      z-index: 200;
+      flex-direction: column;
+      justify-content: center;
+      padding: 20px;
+    }
+    .email-overlay.show { display: flex; }
+
+    .email-modal {
+      background: #1a1a2e;
+      border: 1px solid rgba(255,255,255,.08);
+      border-radius: 14px;
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .email-modal h3 {
+      font-size: 13px;
+      font-weight: 700;
+      color: #a78bfa;
+      margin-bottom: 2px;
+    }
+
+    .email-modal label {
+      font-size: 11px;
+      color: #94a3b8;
+      margin-bottom: 4px;
+      display: block;
+    }
+
+    .email-modal input,
+    .email-modal textarea {
+      width: 100%;
+      background: rgba(255,255,255,.05);
+      border: 1px solid rgba(255,255,255,.1);
+      border-radius: 8px;
+      color: #e2e8f0;
+      font-family: 'Inter', sans-serif;
+      font-size: 12px;
+      padding: 8px 10px;
+      outline: none;
+      resize: none;
+      transition: border-color .15s;
+    }
+    .email-modal input:focus,
+    .email-modal textarea:focus {
+      border-color: #6366f1;
+    }
+
+    .email-modal-actions {
+      display: flex;
+      gap: 8px;
+      justify-content: flex-end;
+    }
+
+    .email-path-hint {
+      font-size: 11px;
+      color: #94a3b8;
+      min-height: 16px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .btn-email-send {
+      background: linear-gradient(135deg, #22c55e, #16a34a);
+      color: #fff;
+    }
+    .btn-email-send:hover { filter: brightness(1.12); }
+
+    .btn-email-cancel {
+      background: rgba(255,255,255,.06);
+      color: #94a3b8;
+      border: 1px solid rgba(255,255,255,.08);
+    }
+    .btn-email-cancel:hover { background: rgba(255,255,255,.1); }
+
+    .btn-email-folder {
+      background: rgba(99,102,241,.14);
+      color: #c7d2fe;
+      border: 1px solid rgba(99,102,241,.24);
+    }
+    .btn-email-folder:hover { background: rgba(99,102,241,.22); }
+
+    .btn-email-copy {
+      background: rgba(56,189,248,.14);
+      color: #bae6fd;
+      border: 1px solid rgba(56,189,248,.24);
+    }
+    .btn-email-copy:hover { background: rgba(56,189,248,.22); }
+
+    .btn-email-copy.copied {
+      background: rgba(34,197,94,.2);
+      color: #bbf7d0;
+      border-color: rgba(34,197,94,.35);
+    }
+
+    .email-toast {
+      display: none;
+      font-size: 11px;
+      line-height: 1.4;
+      padding: 8px 10px;
+      border-radius: 8px;
+      border: 1px solid rgba(56,189,248,.28);
+      background: rgba(56,189,248,.12);
+      color: #dbeafe;
+    }
+
+    .email-toast.show {
+      display: block;
+    }
+
+    .email-toast.error {
+      border-color: rgba(239,68,68,.28);
+      background: rgba(239,68,68,.12);
+      color: #fecaca;
+    }
+
     /* Preview modal */
     .preview-overlay {
       display: none;
@@ -204,6 +336,29 @@
   </div>
 
   <div id="content"></div>
+
+  <!-- Email modal -->
+  <div class="email-overlay" id="emailOverlay">
+    <div class="email-modal">
+      <h3>✉ Отправить по e-mail</h3>
+      <div>
+        <label>Адрес получателя</label>
+        <input type="email" id="emailTo" placeholder="colleague@example.com" autocomplete="email">
+      </div>
+      <div>
+        <label>Комментарий (необязательно)</label>
+        <textarea id="emailComment" rows="3" placeholder="Добавьте заметку к письму…"></textarea>
+      </div>
+      <div class="email-toast" id="emailToast"></div>
+      <div class="email-path-hint" id="emailPathHint">Путь к файлу будет скопирован автоматически после отправки</div>
+      <div class="email-modal-actions">
+        <button class="btn btn-email-cancel" id="emailCancel">Отмена</button>
+        <button class="btn btn-email-folder" id="emailOpenDownloads">Папка загрузок</button>
+        <button class="btn btn-email-copy" id="emailCopyPath">Скопировать путь</button>
+        <button class="btn btn-email-send" id="emailSend">✉ Отправить</button>
+      </div>
+    </div>
+  </div>
 
   <div class="preview-overlay" id="previewOverlay">
     <div class="preview-header">

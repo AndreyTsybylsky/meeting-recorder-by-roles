@@ -9,6 +9,71 @@ document.addEventListener('DOMContentLoaded', () => {
   const previewBody = document.getElementById('previewBody');
   const previewClose = document.getElementById('previewClose');
 
+  // Email modal elements
+  const emailOverlay = document.getElementById('emailOverlay');
+  const emailToInput = document.getElementById('emailTo');
+  const emailCommentInput = document.getElementById('emailComment');
+  const emailCancel = document.getElementById('emailCancel');
+  const emailOpenDownloads = document.getElementById('emailOpenDownloads');
+  const emailCopyPath = document.getElementById('emailCopyPath');
+  const emailPathHint = document.getElementById('emailPathHint');
+  const emailToast = document.getElementById('emailToast');
+  const emailSendBtn = document.getElementById('emailSend');
+  const MAIL_SYNC_TAG = '[[MR_SYNC_V1]]';
+  let pendingEmailSession = null;
+  let lastDownloadedPath = '';
+  let copyStateResetTimer = null;
+  let toastResetTimer = null;
+
+  emailCancel.addEventListener('click', () => {
+    emailOverlay.classList.remove('show');
+    pendingEmailSession = null;
+    resetCopyButtonState();
+    hideToast();
+  });
+
+  emailOpenDownloads.addEventListener('click', () => {
+    chrome.downloads.showDefaultFolder();
+  });
+
+  emailCopyPath.addEventListener('click', async () => {
+    if (!lastDownloadedPath) {
+      if (!pendingEmailSession) {
+        emailPathHint.textContent = 'Откройте модалку для нужной сессии';
+        showToast('Нет активной сессии для скачивания', true);
+        return;
+      }
+
+      emailPathHint.textContent = 'Скачиваю файл и получаю путь...';
+      const fullPath = await downloadTranscriptAndGetPath(pendingEmailSession, false);
+      if (!fullPath) {
+        showToast('Не удалось скачать файл или получить путь', true);
+        return;
+      }
+      lastDownloadedPath = fullPath;
+    }
+
+    const copied = await copyToClipboard(lastDownloadedPath);
+    emailPathHint.textContent = copied
+      ? `Путь скопирован: ${lastDownloadedPath}`
+      : 'Не удалось скопировать путь автоматически';
+    if (copied) {
+      setCopyButtonCopiedState();
+      showToast('Путь к файлу скопирован в буфер');
+    } else {
+      showToast('Не удалось скопировать путь автоматически', true);
+    }
+  });
+
+  emailSendBtn.addEventListener('click', () => {
+    if (!pendingEmailSession) return;
+    const to = emailToInput.value.trim();
+    const comment = emailCommentInput.value.trim();
+    sendSessionByEmail(pendingEmailSession, to, comment);
+    emailOverlay.classList.remove('show');
+    pendingEmailSession = null;
+  });
+
   previewClose.addEventListener('click', () => {
     previewOverlay.classList.remove('show');
   });
@@ -46,6 +111,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
       card.querySelector('.btn-download').addEventListener('click', () => downloadSession(s));
       card.querySelector('.btn-preview').addEventListener('click', () => previewSession(s));
+      card.querySelector('.btn-email').addEventListener('click', () => openEmailModal(s));
       card.querySelector('.btn-delete').addEventListener('click', () => deleteSession(s.id));
     });
   }
@@ -74,6 +140,7 @@ document.addEventListener('DOMContentLoaded', () => {
         <div class="session-actions">
           <button class="btn btn-download">⬇ Скачать</button>
           <button class="btn btn-preview">👁 Просмотр</button>
+          <button class="btn btn-email">✉ Email</button>
           <button class="btn btn-delete">🗑</button>
         </div>
       </div>
@@ -114,6 +181,57 @@ document.addEventListener('DOMContentLoaded', () => {
     previewOverlay.classList.add('show');
   }
 
+  function openEmailModal(s) {
+    pendingEmailSession = s;
+    emailToInput.value = 'andrey.tsybulski@innowise.com';
+    emailCommentInput.value = '';
+    resetCopyButtonState();
+    hideToast();
+    emailPathHint.textContent = lastDownloadedPath
+      ? `Последний файл: ${lastDownloadedPath}`
+      : 'Путь к файлу будет скопирован автоматически после отправки';
+    emailOverlay.classList.add('show');
+    emailCommentInput.focus();
+  }
+
+  async function sendSessionByEmail(s, to, comment) {
+    const date = new Date(s.date);
+    const dateStr = date.toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit', year: 'numeric' });
+    const timeStr = date.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+    const title = s.title || s.meetingCode;
+    const speakerCount = new Set(s.transcript.map(t => t.name)).size;
+    const fileName = title.replace(/[<>:"/\\|?*]/g, '_') + '.txt';
+
+    // 1. Auto-download transcript as .txt and copy the full path when completed
+    const fullPath = await downloadTranscriptAndGetPath(s, false);
+    if (!fullPath) {
+      emailPathHint.textContent = 'Ошибка скачивания файла';
+    } else {
+      lastDownloadedPath = fullPath;
+      const copied = await copyToClipboard(fullPath);
+      emailPathHint.textContent = copied
+        ? `Путь скопирован: ${fullPath}`
+        : `Файл скачан: ${fullPath}`;
+      if (copied) {
+        setCopyButtonCopiedState();
+        showToast('Путь к файлу скопирован в буфер');
+      } else {
+        showToast('Файл скачан, но путь не удалось скопировать', true);
+      }
+    }
+
+    // 2. Open Gmail compose with short body only (no transcript in URL)
+    const subject = `${MAIL_SYNC_TAG} Запись Meet: ${title} (${dateStr})`;
+    let body = '';
+    body += `${MAIL_SYNC_TAG}\n`;
+    body += `MR_SESSION_ID: ${s.id || 'unknown'}\n\n`;
+    if (comment) body += `${comment}\n\n`;
+    body += `Встреча: ${title}\nДата: ${dateStr} в ${timeStr}\nУчастников: ${speakerCount} · Реплик: ${s.transcript.length}\n\nТранскрипт во вложении: ${fileName}`;
+
+    const gmailUrl = `https://mail.google.com/mail/?view=cm&to=${encodeURIComponent(to)}&su=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+    chrome.tabs.create({ url: gmailUrl });
+  }
+
   function deleteSession(sessionId) {
     chrome.runtime.sendMessage({ type: 'DELETE_SESSION', sessionId }, () => {
       loadSessions();
@@ -124,5 +242,125 @@ document.addEventListener('DOMContentLoaded', () => {
     const div = document.createElement('div');
     div.textContent = str || '';
     return div.innerHTML;
+  }
+
+  async function copyToClipboard(value) {
+    if (!value) return false;
+
+    try {
+      await navigator.clipboard.writeText(value);
+      return true;
+    } catch (_) {
+      const temp = document.createElement('textarea');
+      temp.value = value;
+      temp.setAttribute('readonly', '');
+      temp.style.position = 'fixed';
+      temp.style.left = '-9999px';
+      document.body.appendChild(temp);
+      temp.select();
+      const copied = document.execCommand('copy');
+      document.body.removeChild(temp);
+      return copied;
+    }
+  }
+
+  function downloadTranscriptAndGetPath(session, revealInFolder) {
+    return new Promise((resolve) => {
+      const title = session.title || session.meetingCode;
+      const transcriptText = session.transcript.map(item => `${item.name}: ${item.text}`).join('\n\n');
+      const blob = new Blob([transcriptText], { type: 'text/plain;charset=utf-8' });
+      const fileUrl = URL.createObjectURL(blob);
+      const fileName = title.replace(/[<>:"/\\|?*]/g, '_') + '.txt';
+
+      chrome.downloads.download({
+        url: fileUrl,
+        filename: fileName,
+        saveAs: false,
+        conflictAction: 'uniquify'
+      }, async (downloadId) => {
+        URL.revokeObjectURL(fileUrl);
+        if (chrome.runtime.lastError || !downloadId) {
+          resolve('');
+          return;
+        }
+
+        const completed = await waitForDownloadCompletion(downloadId, 45000);
+        if (!completed) {
+          resolve('');
+          return;
+        }
+
+        if (revealInFolder) {
+          chrome.downloads.show(downloadId);
+        }
+
+        chrome.downloads.search({ id: downloadId }, (items) => {
+          const fullPath = items && items[0] && items[0].filename ? items[0].filename : '';
+          resolve(fullPath || '');
+        });
+      });
+    });
+  }
+
+  function waitForDownloadCompletion(downloadId, timeoutMs) {
+    return new Promise((resolve) => {
+      let done = false;
+
+      const finish = (ok) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timeout);
+        chrome.downloads.onChanged.removeListener(onChanged);
+        resolve(ok);
+      };
+
+      const onChanged = (delta) => {
+        if (delta.id !== downloadId || !delta.state) return;
+        if (delta.state.current === 'complete') finish(true);
+        if (delta.state.current === 'interrupted') finish(false);
+      };
+
+      const timeout = setTimeout(() => finish(false), timeoutMs);
+      chrome.downloads.onChanged.addListener(onChanged);
+
+      // Fast path in case the download already completed before listener setup.
+      chrome.downloads.search({ id: downloadId }, (items) => {
+        const item = items && items[0];
+        if (!item || !item.state) return;
+        if (item.state === 'complete') finish(true);
+        if (item.state === 'interrupted') finish(false);
+      });
+    });
+  }
+
+  function setCopyButtonCopiedState() {
+    emailCopyPath.textContent = 'Скопировано';
+    emailCopyPath.classList.add('copied');
+
+    if (copyStateResetTimer) clearTimeout(copyStateResetTimer);
+    copyStateResetTimer = setTimeout(() => {
+      resetCopyButtonState();
+    }, 2500);
+  }
+
+  function resetCopyButtonState() {
+    emailCopyPath.textContent = 'Скопировать путь';
+    emailCopyPath.classList.remove('copied');
+  }
+
+  function showToast(message, isError = false) {
+    emailToast.textContent = message;
+    emailToast.classList.add('show');
+    emailToast.classList.toggle('error', isError);
+
+    if (toastResetTimer) clearTimeout(toastResetTimer);
+    toastResetTimer = setTimeout(() => {
+      hideToast();
+    }, 2800);
+  }
+
+  function hideToast() {
+    emailToast.classList.remove('show', 'error');
+    emailToast.textContent = '';
   }
 });
