@@ -218,7 +218,7 @@ document.addEventListener('DOMContentLoaded', () => {
     body += `Встреча: ${title}\nДата: ${dateStr} в ${timeStr}\nУчастников: ${speakerCount} · Реплик: ${s.transcript.length}\n\nТранскрипт во вложении: ${fileName}`;
 
     const gmailUrl = `https://mail.google.com/mail/?view=cm&to=${encodeURIComponent(to)}&su=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
-    chrome.tabs.create({ url: gmailUrl });
+    requestOpenUrlViaBackground(gmailUrl);
 
     // 2. Auto-download transcript as .txt and copy the full path when completed
     const fullPath = await downloadTranscriptAndGetPath(s, false);
@@ -243,6 +243,15 @@ document.addEventListener('DOMContentLoaded', () => {
   function deleteSession(sessionId) {
     chrome.runtime.sendMessage({ type: 'DELETE_SESSION', sessionId }, () => {
       loadSessions();
+    });
+  }
+
+  function requestOpenUrlViaBackground(url) {
+    chrome.runtime.sendMessage({ type: 'OPEN_URL', url }, (response) => {
+      if (chrome.runtime.lastError || !response || !response.ok) {
+        // Fallback for cases when service worker is temporarily unavailable.
+        chrome.tabs.create({ url });
+      }
     });
   }
 

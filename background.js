@@ -4,6 +4,24 @@
 // ============================================================
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.type === 'OPEN_URL') {
+    const url = typeof message.url === 'string' ? message.url : '';
+    if (!url) {
+      sendResponse({ ok: false, error: 'missing_url' });
+      return;
+    }
+
+    chrome.tabs.create({ url }, (tab) => {
+      if (chrome.runtime.lastError) {
+        sendResponse({ ok: false, error: chrome.runtime.lastError.message });
+        return;
+      }
+      sendResponse({ ok: true, tabId: tab && tab.id ? tab.id : null });
+    });
+
+    return true;
+  }
+
   if (message.type === 'SAVE_SESSION') {
     const session = message.session;
     
