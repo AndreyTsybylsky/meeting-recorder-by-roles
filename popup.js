@@ -17,6 +17,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const emailOpenDownloads = document.getElementById('emailOpenDownloads');
   const emailCopyPath = document.getElementById('emailCopyPath');
   const emailPathHint = document.getElementById('emailPathHint');
+  const emailAttachHint = document.getElementById('emailAttachHint');
   const emailToast = document.getElementById('emailToast');
   const emailSendBtn = document.getElementById('emailSend');
   const MAIL_SYNC_TAG = '[[MR_SYNC_V1]]';
@@ -33,7 +34,10 @@ document.addEventListener('DOMContentLoaded', () => {
     if (info.os === 'mac') {
       pasteShortcut = 'Cmd+V';
     }
+    updateAttachHintText();
   });
+
+  updateAttachHintText();
 
   emailCancel.addEventListener('click', () => {
     emailOverlay.classList.remove('show');
@@ -310,6 +314,15 @@ document.addEventListener('DOMContentLoaded', () => {
     if (!fileName) return '';
     if (platformOs === 'mac') return `~/Downloads/${fileName}`;
     return fileName;
+  }
+
+  function updateAttachHintText() {
+    if (platformOs === 'mac') {
+      emailAttachHint.innerHTML = '<strong>Mac:</strong> В Gmail: Cmd+Shift+G -> Cmd+V -> Enter';
+      return;
+    }
+
+    emailAttachHint.innerHTML = '<strong>Windows:</strong> В окне выбора файла: Ctrl+L -> Ctrl+V -> Enter';
   }
 
   function downloadTranscriptAndGetPath(session, revealInFolder) {

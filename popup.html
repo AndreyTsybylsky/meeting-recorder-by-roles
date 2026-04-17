@@ -216,6 +216,20 @@
       text-overflow: ellipsis;
     }
 
+    .email-attach-hint {
+      font-size: 11px;
+      line-height: 1.45;
+      color: #cbd5e1;
+      background: rgba(99,102,241,.1);
+      border: 1px solid rgba(99,102,241,.22);
+      border-radius: 8px;
+      padding: 8px 10px;
+    }
+
+    .email-attach-hint strong {
+      color: #e2e8f0;
+    }
+
     .btn-email-send {
       background: linear-gradient(135deg, #22c55e, #16a34a);
       color: #fff;
@@ -351,6 +365,7 @@
       </div>
       <div class="email-toast" id="emailToast"></div>
       <div class="email-path-hint" id="emailPathHint">Путь к файлу будет скопирован автоматически после отправки</div>
+      <div class="email-attach-hint" id="emailAttachHint"></div>
       <div class="email-modal-actions">
         <button class="btn btn-email-cancel" id="emailCancel">Отмена</button>
         <button class="btn btn-email-folder" id="emailOpenDownloads">Папка загрузок</button>
