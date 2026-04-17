@@ -30,6 +30,47 @@ function detectPlatform() {
 function getCaptionConfig() {
   return CAPTION_SELECTORS[PLATFORM] || CAPTION_SELECTORS.meet;
 }
+let widgetHost = null;
+
+function shouldShowWidget() {
+  if (PLATFORM === 'meet') {
+    return true;
+  }
+
+  if (PLATFORM === 'teams') {
+    const path = (window.location.pathname || '').toLowerCase();
+    const looksLikeMeetingPath = /\/meet\//.test(path) || /\/meetup-join\//.test(path) || /\/l\/meetup-join\//.test(path);
+    const hasCallControls = !!document.querySelector(
+      '[data-tid*="hangup" i], [data-tid*="microphone" i], [data-tid*="camera" i], [data-tid*="share" i], button[aria-label*="Leave" i], button[aria-label*="Покинуть" i]'
+    );
+    const hasMeetingSurface = !!document.querySelector(
+      '[data-tid*="meeting-stage" i], [data-tid*="calling" i], [data-tid="closed-caption-renderer-wrapper"], [data-tid="closed-captions-v2-items-renderer"]'
+    );
+
+    return looksLikeMeetingPath && (hasCallControls || hasMeetingSurface);
+  }
+
+  return false;
+}
+
+function ensureWidgetState() {
+  if (shouldShowWidget()) {
+    if (!widgetHost || !document.body.contains(widgetHost)) {
+      injectWidget();
+    }
+    return;
+  }
+
+  destroyWidget();
+}
+
+function destroyWidget() {
+  if (widgetHost && widgetHost.parentNode) {
+    widgetHost.parentNode.removeChild(widgetHost);
+  }
+  widgetHost = null;
+  delete window.__meetTranscriberRefreshUI;
+}
 
 let isRecording = false;
 let transcript = []; // Array of { id: string, name: string, text: string }
@@ -412,6 +453,10 @@ captionObserver.observe(document.body, { childList: true, subtree: true, charact
 // ── Floating Widget (Shadow DOM) ────────────────────────────
 
 function injectWidget() {
+  if (widgetHost && document.body.contains(widgetHost)) {
+    return;
+  }
+
   const widgetTitle = PLATFORM === 'teams' ? '📝 Teams Transcriber' : '📝 Meet Transcriber';
   const host = document.createElement('div');
   host.id = 'meet-transcriber-host';
@@ -423,6 +468,7 @@ function injectWidget() {
   host.style.height = '0';
   host.style.zIndex = '2147483647';
   document.body.appendChild(host);
+  widgetHost = host;
 
   const shadow = host.attachShadow({ mode: 'closed' });
 
@@ -770,7 +816,11 @@ function refreshUI() {
 
 // Inject the widget once the page is ready
 if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', injectWidget);
+  document.addEventListener('DOMContentLoaded', ensureWidgetState);
 } else {
-  injectWidget();
+  ensureWidgetState();
 }
+
+window.addEventListener('popstate', ensureWidgetState);
+window.addEventListener('hashchange', ensureWidgetState);
+setInterval(ensureWidgetState, 2000);
