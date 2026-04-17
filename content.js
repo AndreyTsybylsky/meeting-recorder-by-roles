@@ -196,6 +196,23 @@ function isRealName(name) {
   return true;
 }
 
+function escapeRegExp(str) {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function sanitizeSpeechText(speakerName, speechText) {
+  let normalizedText = (speechText || '').replace(/\s+/g, ' ').trim();
+  if (!normalizedText) return '';
+
+  if (speakerName) {
+    const escapedName = escapeRegExp(speakerName.trim());
+    const leadingSpeakerPattern = new RegExp(`^(?:${escapedName}[\\s:,-]*)+`, 'i');
+    normalizedText = normalizedText.replace(leadingSpeakerPattern, '').trim();
+  }
+
+  return normalizedText;
+}
+
 function getUserRealName() {
   if (memoizedUserName) return memoizedUserName;
 
@@ -426,6 +443,9 @@ const captionObserver = new MutationObserver((mutations) => {
           speakerName = speakerName || "Speaker";
         }
       }
+
+      speechText = sanitizeSpeechText(speakerName, speechText);
+      if (!speechText) continue;
 
       // Track by a unique ID assigned to the DOM container
       let blockId = blockContainer.getAttribute('data-transcript-id');
@@ -693,11 +713,15 @@ function injectWidget() {
 
   let panelOpen = false;
 
-  togglePanelBtn.addEventListener('click', () => {
-    panelOpen = !panelOpen;
+  function setPanelOpen(nextOpen) {
+    panelOpen = nextOpen;
     panel.classList.toggle('open', panelOpen);
     togglePanelBtn.classList.toggle('open', panelOpen);
     if (panelOpen) refreshUI();
+  }
+
+  togglePanelBtn.addEventListener('click', () => {
+    setPanelOpen(!panelOpen);
   });
 
   toggleRecordBtn.addEventListener('click', () => {
@@ -710,6 +734,7 @@ function injectWidget() {
       // Clear transcript for a fresh start if it wasn't already cleared
       transcript = []; 
       chrome.storage.local.set({ isRecording: true, transcript: [] });
+      setPanelOpen(false);
     } else {
       // End of session - finalize and save to history
       finalizeSession();
