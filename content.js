@@ -377,20 +377,47 @@ function getUserRealName() {
   return null;
 }
 
+const STORAGE_SCOPE = `${PLATFORM}:${getMeetingCode()}`;
+const RECORDING_STORAGE_KEY = `isRecording:${STORAGE_SCOPE}`;
+const TRANSCRIPT_STORAGE_KEY = `transcript:${STORAGE_SCOPE}`;
+
+function setScopedRecordingState(nextIsRecording, nextTranscript) {
+  chrome.storage.local.set({
+    [RECORDING_STORAGE_KEY]: nextIsRecording,
+    [TRANSCRIPT_STORAGE_KEY]: nextTranscript
+  });
+}
+
 // ── Persistence ─────────────────────────────────────────────
-chrome.storage.local.get(['isRecording', 'transcript'], (res) => {
-  if (res.isRecording !== undefined) isRecording = res.isRecording;
-  if (res.transcript) transcript = res.transcript;
+chrome.storage.local.get([RECORDING_STORAGE_KEY, TRANSCRIPT_STORAGE_KEY, 'isRecording', 'transcript'], (res) => {
+  const scopedIsRecording = res[RECORDING_STORAGE_KEY];
+  const scopedTranscript = res[TRANSCRIPT_STORAGE_KEY];
+
+  if (scopedIsRecording !== undefined) {
+    isRecording = scopedIsRecording;
+  } else if (res.isRecording !== undefined) {
+    // Migrate legacy global state into scoped state for this meeting context.
+    isRecording = res.isRecording;
+    chrome.storage.local.set({ [RECORDING_STORAGE_KEY]: isRecording });
+  }
+
+  if (Array.isArray(scopedTranscript)) {
+    transcript = scopedTranscript;
+  } else if (Array.isArray(res.transcript)) {
+    transcript = res.transcript;
+    chrome.storage.local.set({ [TRANSCRIPT_STORAGE_KEY]: transcript });
+  }
+
   refreshUI();
 });
 
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area === 'local') {
-    if (changes.isRecording !== undefined) {
-      isRecording = changes.isRecording.newValue;
+    if (changes[RECORDING_STORAGE_KEY] !== undefined) {
+      isRecording = changes[RECORDING_STORAGE_KEY].newValue;
     }
-    if (changes.transcript !== undefined) {
-      transcript = changes.transcript.newValue;
+    if (changes[TRANSCRIPT_STORAGE_KEY] !== undefined) {
+      transcript = changes[TRANSCRIPT_STORAGE_KEY].newValue;
     }
     refreshUI();
   }
@@ -400,7 +427,7 @@ let saveTimeout;
 function saveTranscript() {
   clearTimeout(saveTimeout);
   saveTimeout = setTimeout(() => {
-    chrome.storage.local.set({ transcript });
+    chrome.storage.local.set({ [TRANSCRIPT_STORAGE_KEY]: transcript });
     refreshUI();
   }, 500);
 }
@@ -479,7 +506,7 @@ function stopAndSave() {
   if (!isRecording) return;
   finalizeSession();
   isRecording = false;
-  chrome.storage.local.set({ isRecording: false, transcript: [] });
+  setScopedRecordingState(false, []);
   currentSessionId = null;
   refreshUI();
 }
@@ -922,14 +949,14 @@ function injectWidget() {
       currentSessionId = Date.now().toString();
       // Clear transcript for a fresh start if it wasn't already cleared
       transcript = []; 
-      chrome.storage.local.set({ isRecording: true, transcript: [] });
+      setScopedRecordingState(true, []);
       setPanelOpen(false);
     } else {
       // End of session - finalize and save to history
       finalizeSession();
       // We clear the active transcript after saving to history
       transcript = [];
-      chrome.storage.local.set({ isRecording: false, transcript: [] });
+      setScopedRecordingState(false, []);
       currentSessionId = null;
     }
     
@@ -974,7 +1001,7 @@ function injectWidget() {
   clearBtn.addEventListener('click', () => {
     if (confirm('Очистить текущий экран? История сессий сохранится.')) {
       transcript = [];
-      chrome.storage.local.set({ transcript: [] });
+      chrome.storage.local.set({ [TRANSCRIPT_STORAGE_KEY]: [] });
       refreshUI();
     }
   });
