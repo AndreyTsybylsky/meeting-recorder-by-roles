@@ -17,6 +17,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const emailOpenDownloads = document.getElementById('emailOpenDownloads');
   const emailCopyPath = document.getElementById('emailCopyPath');
   const emailPathHint = document.getElementById('emailPathHint');
+  const emailAttachHint = document.getElementById('emailAttachHint');
   const emailToast = document.getElementById('emailToast');
   const emailSendBtn = document.getElementById('emailSend');
   const MAIL_SYNC_TAG = '[[MR_SYNC_V1]]';
@@ -24,6 +25,19 @@ document.addEventListener('DOMContentLoaded', () => {
   let lastDownloadedPath = '';
   let copyStateResetTimer = null;
   let toastResetTimer = null;
+  let pasteShortcut = 'Ctrl+V';
+  let platformOs = 'win';
+
+  chrome.runtime.getPlatformInfo((info) => {
+    if (!info || !info.os) return;
+    platformOs = info.os;
+    if (info.os === 'mac') {
+      pasteShortcut = 'Cmd+V';
+    }
+    updateAttachHintText();
+  });
+
+  updateAttachHintText();
 
   emailCancel.addEventListener('click', () => {
     emailOverlay.classList.remove('show');
@@ -59,7 +73,7 @@ document.addEventListener('DOMContentLoaded', () => {
       : 'Не удалось скопировать путь автоматически';
     if (copied) {
       setCopyButtonCopiedState();
-      showToast('Путь к файлу скопирован в буфер');
+      showToast(`Путь к файлу скопирован. В Gmail нажмите ${pasteShortcut}`);
     } else {
       showToast('Не удалось скопировать путь автоматически', true);
     }
@@ -202,7 +216,26 @@ document.addEventListener('DOMContentLoaded', () => {
     const speakerCount = new Set(s.transcript.map(t => t.name)).size;
     const fileName = title.replace(/[<>:"/\\|?*]/g, '_') + '.txt';
 
-    // 1. Auto-download transcript as .txt and copy the full path when completed
+    // Best-effort immediate copy while click gesture is still active.
+    const likelyPath = buildLikelyDownloadPath(fileName);
+    if (likelyPath && copyToClipboardSyncBestEffort(likelyPath)) {
+      lastDownloadedPath = likelyPath;
+      setCopyButtonCopiedState();
+      showToast(`Путь скопирован. В Gmail нажмите ${pasteShortcut}`);
+    }
+
+    // 1. Open Gmail compose immediately to avoid popup lifecycle issues on macOS.
+    const subject = `${MAIL_SYNC_TAG} Запись Meet: ${title} (${dateStr})`;
+    let body = '';
+    body += `${MAIL_SYNC_TAG}\n`;
+    body += `MR_SESSION_ID: ${s.id || 'unknown'}\n\n`;
+    if (comment) body += `${comment}\n\n`;
+    body += `Встреча: ${title}\nДата: ${dateStr} в ${timeStr}\nУчастников: ${speakerCount} · Реплик: ${s.transcript.length}\n\nТранскрипт во вложении: ${fileName}`;
+
+    const gmailUrl = `https://mail.google.com/mail/?view=cm&to=${encodeURIComponent(to)}&su=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+    requestOpenUrlViaBackground(gmailUrl);
+
+    // 2. Auto-download transcript as .txt and copy the full path when completed
     const fullPath = await downloadTranscriptAndGetPath(s, false);
     if (!fullPath) {
       emailPathHint.textContent = 'Ошибка скачивания файла';
@@ -214,27 +247,26 @@ document.addEventListener('DOMContentLoaded', () => {
         : `Файл скачан: ${fullPath}`;
       if (copied) {
         setCopyButtonCopiedState();
-        showToast('Путь к файлу скопирован в буфер');
+        showToast(`Путь к файлу скопирован. В Gmail нажмите ${pasteShortcut}`);
       } else {
         showToast('Файл скачан, но путь не удалось скопировать', true);
       }
     }
 
-    // 2. Open Gmail compose with short body only (no transcript in URL)
-    const subject = `${MAIL_SYNC_TAG} Запись Meet: ${title} (${dateStr})`;
-    let body = '';
-    body += `${MAIL_SYNC_TAG}\n`;
-    body += `MR_SESSION_ID: ${s.id || 'unknown'}\n\n`;
-    if (comment) body += `${comment}\n\n`;
-    body += `Встреча: ${title}\nДата: ${dateStr} в ${timeStr}\nУчастников: ${speakerCount} · Реплик: ${s.transcript.length}\n\nТранскрипт во вложении: ${fileName}`;
-
-    const gmailUrl = `https://mail.google.com/mail/?view=cm&to=${encodeURIComponent(to)}&su=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
-    chrome.tabs.create({ url: gmailUrl });
   }
 
   function deleteSession(sessionId) {
     chrome.runtime.sendMessage({ type: 'DELETE_SESSION', sessionId }, () => {
       loadSessions();
+    });
+  }
+
+  function requestOpenUrlViaBackground(url) {
+    chrome.runtime.sendMessage({ type: 'OPEN_URL', url }, (response) => {
+      if (chrome.runtime.lastError || !response || !response.ok) {
+        // Fallback for cases when service worker is temporarily unavailable.
+        chrome.tabs.create({ url });
+      }
     });
   }
 
@@ -262,6 +294,35 @@ document.addEventListener('DOMContentLoaded', () => {
       document.body.removeChild(temp);
       return copied;
     }
+  }
+
+  function copyToClipboardSyncBestEffort(value) {
+    if (!value) return false;
+    const temp = document.createElement('textarea');
+    temp.value = value;
+    temp.setAttribute('readonly', '');
+    temp.style.position = 'fixed';
+    temp.style.left = '-9999px';
+    document.body.appendChild(temp);
+    temp.select();
+    const copied = document.execCommand('copy');
+    document.body.removeChild(temp);
+    return copied;
+  }
+
+  function buildLikelyDownloadPath(fileName) {
+    if (!fileName) return '';
+    if (platformOs === 'mac') return `~/Downloads/${fileName}`;
+    return fileName;
+  }
+
+  function updateAttachHintText() {
+    if (platformOs === 'mac') {
+      emailAttachHint.innerHTML = '<strong>Mac:</strong> В Gmail: Cmd+Shift+G -> Cmd+V -> Enter';
+      return;
+    }
+
+    emailAttachHint.innerHTML = '<strong>Windows:</strong> В окне выбора файла: Ctrl+L -> Ctrl+V -> Enter';
   }
 
   function downloadTranscriptAndGetPath(session, revealInFolder) {
