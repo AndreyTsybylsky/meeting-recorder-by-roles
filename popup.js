@@ -24,6 +24,13 @@ document.addEventListener('DOMContentLoaded', () => {
   let lastDownloadedPath = '';
   let copyStateResetTimer = null;
   let toastResetTimer = null;
+  let pasteShortcut = 'Ctrl+V';
+
+  chrome.runtime.getPlatformInfo((info) => {
+    if (info && info.os === 'mac') {
+      pasteShortcut = 'Cmd+V';
+    }
+  });
 
   emailCancel.addEventListener('click', () => {
     emailOverlay.classList.remove('show');
@@ -59,7 +66,7 @@ document.addEventListener('DOMContentLoaded', () => {
       : 'Не удалось скопировать путь автоматически';
     if (copied) {
       setCopyButtonCopiedState();
-      showToast('Путь к файлу скопирован в буфер');
+      showToast(`Путь к файлу скопирован. В Gmail нажмите ${pasteShortcut}`);
     } else {
       showToast('Не удалось скопировать путь автоматически', true);
     }
@@ -214,7 +221,7 @@ document.addEventListener('DOMContentLoaded', () => {
         : `Файл скачан: ${fullPath}`;
       if (copied) {
         setCopyButtonCopiedState();
-        showToast('Путь к файлу скопирован в буфер');
+        showToast(`Путь к файлу скопирован. В Gmail нажмите ${pasteShortcut}`);
       } else {
         showToast('Файл скачан, но путь не удалось скопировать', true);
       }
