@@ -415,6 +415,13 @@ function injectWidget() {
   const widgetTitle = PLATFORM === 'teams' ? '📝 Teams Transcriber' : '📝 Meet Transcriber';
   const host = document.createElement('div');
   host.id = 'meet-transcriber-host';
+  // Keep host out of normal document flow to avoid shifting page layout.
+  host.style.position = 'fixed';
+  host.style.top = '0';
+  host.style.left = '0';
+  host.style.width = '0';
+  host.style.height = '0';
+  host.style.zIndex = '2147483647';
   document.body.appendChild(host);
 
   const shadow = host.attachShadow({ mode: 'closed' });
