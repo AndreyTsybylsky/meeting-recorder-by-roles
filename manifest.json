@@ -27,7 +27,7 @@
   },
   "content_scripts": [
     {
-      "matches": ["*://meet.google.com/*", "*://teams.microsoft.com/*", "*://teams.live.com/*"],
+      "matches": ["*://meet.google.com/*", "*://teams.microsoft.com/*", "*://teams.live.com/*", "*://zoom.us/*", "*://*.zoom.us/*"],
       "js": ["content.js"]
     }
   ]

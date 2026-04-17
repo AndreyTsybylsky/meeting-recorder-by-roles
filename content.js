@@ -1,6 +1,6 @@
 // ============================================================
 // Meet Transcriber — Content Script
-// Captures meeting captions (Google Meet + Microsoft Teams)
+// Captures meeting captions (Google Meet + Microsoft Teams + Zoom)
 // ============================================================
 
 const PLATFORM = detectPlatform();
@@ -17,6 +17,12 @@ const CAPTION_SELECTORS = {
     block: '[data-tid="closed-captions-v2-items-renderer"], .fui-ChatMessageCompact',
     name: '[data-tid="author"], .fui-ChatMessageCompact__author, [data-tid*="caption-speaker" i]',
     text: '[data-tid="closed-caption-text"], [data-tid*="caption-text" i], .fui-ChatMessageCompact__body'
+  },
+  zoom: {
+    container: '#live-transcription-subtitle, .live-transcription-subtitle__box, .live-transcription-subtitle__item, [aria-live="polite"], [aria-live="assertive"], [data-testid*="caption" i], [data-testid*="transcript" i], [class*="caption" i], [class*="transcript" i]',
+    block: '#live-transcription-subtitle, .live-transcription-subtitle__box, .live-transcription-subtitle__item, [data-testid*="caption-message" i], [data-testid*="transcript-message" i], [class*="caption-message" i], [class*="transcript-message" i], [class*="caption-item" i], [class*="transcript-item" i]',
+    name: '[data-testid*="speaker" i], .speaker-active-container__wrap, [class*="speaker" i], [class*="name" i]',
+    text: '.live-transcription-subtitle__item, #live-transcription-subtitle, [data-testid*="caption-text" i], [data-testid*="transcript-text" i], [class*="caption-text" i], [class*="transcript-text" i], [class*="subtitle" i], [class*="caption-line" i], [class*="caption-content" i]'
   }
 };
 
@@ -24,6 +30,7 @@ function detectPlatform() {
   const host = window.location.hostname;
   if (host.includes('meet.google.com')) return 'meet';
   if (host.includes('teams.microsoft.com') || host.includes('teams.live.com')) return 'teams';
+  if (host.includes('zoom.us')) return 'zoom';
   return 'unknown';
 }
 
@@ -45,6 +52,19 @@ function shouldShowWidget() {
     );
     const hasMeetingSurface = !!document.querySelector(
       '[data-tid*="meeting-stage" i], [data-tid*="calling" i], [data-tid="closed-caption-renderer-wrapper"], [data-tid="closed-captions-v2-items-renderer"]'
+    );
+
+    return looksLikeMeetingPath && (hasCallControls || hasMeetingSurface);
+  }
+
+  if (PLATFORM === 'zoom') {
+    const path = (window.location.pathname || '').toLowerCase();
+    const looksLikeMeetingPath = /\/wc\//.test(path) || /\/j\//.test(path) || /\/w\//.test(path) || /\/meeting\//.test(path) || /\/start\//.test(path) || /\/join\//.test(path);
+    const hasCallControls = !!document.querySelector(
+      'button[aria-label*="Leave" i], button[aria-label*="Leave Meeting" i], button[aria-label*="End" i], button[aria-label*="End Meeting" i], button[aria-label*="Mute" i], button[aria-label*="Unmute" i], button[aria-label*="mute my microphone" i], button[aria-label*="Start Video" i], button[aria-label*="Stop Video" i], button[aria-label*="start my video" i], [data-testid*="leave" i], [data-testid*="mute" i], [data-testid*="video" i]'
+    );
+    const hasMeetingSurface = !!document.querySelector(
+      '[class*="meeting-client" i], [class*="meeting-app" i], [class*="in-meeting" i], [class*="video-layout" i], [data-testid*="video" i], [data-testid*="meeting" i]'
     );
 
     return looksLikeMeetingPath && (hasCallControls || hasMeetingSurface);
@@ -89,6 +109,12 @@ function getMeetingCode() {
     return match ? match[1] : 'teams-session';
   }
 
+  if (PLATFORM === 'zoom') {
+    const path = window.location.pathname || '';
+    const match = path.match(/\/wc\/([^\/]+)/i) || path.match(/\/j\/([^\/]+)/i) || path.match(/\/w\/([^\/]+)/i);
+    return match ? match[1] : 'zoom-session';
+  }
+
   return 'unknown';
 }
 
@@ -126,6 +152,14 @@ function getMeetingTitle() {
     if (teamsTitle) {
       memoizedMeetingTitle = teamsTitle;
       return teamsTitle;
+    }
+  }
+
+  if (PLATFORM === 'zoom') {
+    const zoomTitle = getZoomMeetingTitle();
+    if (zoomTitle) {
+      memoizedMeetingTitle = zoomTitle;
+      return zoomTitle;
     }
   }
 
@@ -185,6 +219,38 @@ function getTeamsMeetingTitle() {
   return null;
 }
 
+function getZoomMeetingTitle() {
+  const titleCandidates = [
+    document.querySelector('[data-testid*="meeting-title" i]'),
+    document.querySelector('[class*="meeting-title" i]'),
+    document.querySelector('[class*="topic" i]'),
+    document.querySelector('[title*="Zoom" i]')
+  ];
+
+  for (const el of titleCandidates) {
+    if (!el || !el.textContent) continue;
+    const candidate = cleanTitle(el.textContent);
+    if (candidate && candidate.length > 2) {
+      return candidate;
+    }
+  }
+
+  const docTitle = document.title || '';
+  const normalized = cleanTitle(
+    docTitle
+      .replace(/\|\s*Zoom.*/i, '')
+      .replace(/\s*-\s*Zoom.*/i, '')
+      .replace(/^Zoom\s*Meeting\s*-\s*/i, '')
+      .replace(/^Zoom\s*-/i, '')
+  );
+
+  if (normalized && normalized.length > 2 && normalized !== 'Zoom' && normalized !== 'Zoom Meeting') {
+    return normalized;
+  }
+
+  return null;
+}
+
 function isRealName(name) {
   if (!name) return false;
   // Filter out technical strings
@@ -211,6 +277,55 @@ function sanitizeSpeechText(speakerName, speechText) {
   }
 
   return normalizedText;
+}
+
+function sanitizeZoomSpeechText(speechText) {
+  if (!speechText) return '';
+
+  const lines = speechText
+    .split('\n')
+    .map(line => line.replace(/\s+/g, ' ').trim())
+    .filter(Boolean);
+
+  if (lines.length === 0) return '';
+
+  // Zoom often renders speaker avatar initial in a separate line before caption text.
+  if (lines.length > 1 && lines[0].length <= 3) {
+    return lines.slice(1).join(' ').trim();
+  }
+
+  const normalized = lines.join(' ').trim();
+  // Guard against picking full-page text when a selector is too broad.
+  if (normalized.length > 260) return '';
+  return normalized;
+}
+
+function getZoomActiveSpeakerName() {
+  const iframe = document.querySelector('iframe');
+  const doc = iframe && iframe.contentDocument ? iframe.contentDocument : document;
+  const candidates = [
+    doc.querySelector('.speaker-active-container__wrap'),
+    doc.querySelector('.speaker-active-container__video-frame'),
+    doc.querySelector('[data-testid*="speaker" i]')
+  ];
+
+  for (const el of candidates) {
+    if (!el) continue;
+    const text = (el.textContent || '').replace(/\s+/g, ' ').trim();
+    if (isRealName(text)) return text;
+  }
+
+  return null;
+}
+
+function getCaptionObservationRoot() {
+  if (PLATFORM === 'zoom') {
+    const iframe = document.querySelector('iframe');
+    const doc = iframe && iframe.contentDocument ? iframe.contentDocument : null;
+    if (doc && doc.body) return doc.body;
+  }
+
+  return document.body;
 }
 
 function getUserRealName() {
@@ -388,6 +503,10 @@ setInterval(() => {
       leaveBtn = document.querySelector('[data-tid*="hangup" i], button[aria-label*="Leave" i], button[aria-label*="Покинуть" i]');
       endedScreen = document.querySelector('[data-tid*="call-ended" i], [data-tid*="meeting-ended" i]');
       meetingContainer = document.querySelector('[data-tid*="calling" i], [data-tid*="meeting-stage" i], [data-tid*="roster" i]');
+    } else if (PLATFORM === 'zoom') {
+      leaveBtn = document.querySelector('button[aria-label*="Leave" i], button[aria-label*="Leave Meeting" i], button[aria-label*="End" i], button[aria-label*="End Meeting" i], [data-testid*="leave" i]');
+      endedScreen = document.querySelector('[data-testid*="meeting-ended" i], [class*="meeting-ended" i], [class*="ended" i], [aria-label*="Meeting ended" i]');
+      meetingContainer = document.querySelector('[class*="meeting-client" i], [class*="meeting-app" i], [class*="in-meeting" i], [class*="video-layout" i], [data-testid*="meeting" i], [data-testid*="video" i]');
     } else {
       leaveBtn = document.querySelector('[aria-label*="Leave"], [aria-label*="встречу"], [aria-label*="Покинуть"]');
       endedScreen = document.querySelector('[data-termination-message], .V006ub, .J57M8c');
@@ -428,15 +547,20 @@ const captionObserver = new MutationObserver((mutations) => {
     const nameEl = blockContainer.querySelector(captionConfig.name);
     const textEl = blockContainer.querySelector(captionConfig.text);
 
-    if (textEl) {
-      let speechText = textEl.textContent.trim();
+    if (textEl || PLATFORM === 'zoom') {
+      let speechText = textEl ? textEl.textContent.trim() : blockContainer.innerText.trim();
       if (!speechText) continue;
+
+      if (PLATFORM === 'zoom') {
+        speechText = sanitizeZoomSpeechText(speechText);
+        if (!speechText) continue;
+      }
 
       let speakerName = nameEl ? nameEl.textContent.trim() : "";
       
       // Resolve "You/Вы" or missing names to real name
       if (!speakerName || speakerName === "Вы" || speakerName === "You" || !isRealName(speakerName)) {
-        const discoveredName = getUserRealName();
+        const discoveredName = PLATFORM === 'zoom' ? getZoomActiveSpeakerName() : getUserRealName();
         if (discoveredName) {
           speakerName = discoveredName;
         } else {
@@ -468,7 +592,17 @@ const captionObserver = new MutationObserver((mutations) => {
   }
 });
 
-captionObserver.observe(document.body, { childList: true, subtree: true, characterData: true });
+let observedCaptionRoot = null;
+function ensureCaptionObserverAttached() {
+  const nextRoot = getCaptionObservationRoot();
+  if (!nextRoot || observedCaptionRoot === nextRoot) return;
+
+  captionObserver.disconnect();
+  captionObserver.observe(nextRoot, { childList: true, subtree: true, characterData: true });
+  observedCaptionRoot = nextRoot;
+}
+
+ensureCaptionObserverAttached();
 
 // ── Floating Widget (Shadow DOM) ────────────────────────────
 
@@ -477,7 +611,11 @@ function injectWidget() {
     return;
   }
 
-  const widgetTitle = PLATFORM === 'teams' ? '📝 Teams Transcriber' : '📝 Meet Transcriber';
+  const widgetTitle = PLATFORM === 'teams'
+    ? '📝 Teams Transcriber'
+    : PLATFORM === 'zoom'
+      ? '📝 Zoom Transcriber'
+      : '📝 Meet Transcriber';
   const host = document.createElement('div');
   host.id = 'meet-transcriber-host';
   // Keep host out of normal document flow to avoid shifting page layout.
@@ -841,11 +979,18 @@ function refreshUI() {
 
 // Inject the widget once the page is ready
 if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', ensureWidgetState);
+  document.addEventListener('DOMContentLoaded', () => {
+    ensureWidgetState();
+    ensureCaptionObserverAttached();
+  });
 } else {
   ensureWidgetState();
+  ensureCaptionObserverAttached();
 }
 
 window.addEventListener('popstate', ensureWidgetState);
 window.addEventListener('hashchange', ensureWidgetState);
-setInterval(ensureWidgetState, 2000);
+setInterval(() => {
+  ensureWidgetState();
+  ensureCaptionObserverAttached();
+}, 2000);
