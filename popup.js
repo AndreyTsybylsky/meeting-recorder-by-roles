@@ -25,9 +25,12 @@ document.addEventListener('DOMContentLoaded', () => {
   let copyStateResetTimer = null;
   let toastResetTimer = null;
   let pasteShortcut = 'Ctrl+V';
+  let platformOs = 'win';
 
   chrome.runtime.getPlatformInfo((info) => {
-    if (info && info.os === 'mac') {
+    if (!info || !info.os) return;
+    platformOs = info.os;
+    if (info.os === 'mac') {
       pasteShortcut = 'Cmd+V';
     }
   });
@@ -209,6 +212,14 @@ document.addEventListener('DOMContentLoaded', () => {
     const speakerCount = new Set(s.transcript.map(t => t.name)).size;
     const fileName = title.replace(/[<>:"/\\|?*]/g, '_') + '.txt';
 
+    // Best-effort immediate copy while click gesture is still active.
+    const likelyPath = buildLikelyDownloadPath(fileName);
+    if (likelyPath && copyToClipboardSyncBestEffort(likelyPath)) {
+      lastDownloadedPath = likelyPath;
+      setCopyButtonCopiedState();
+      showToast(`Путь скопирован. В Gmail нажмите ${pasteShortcut}`);
+    }
+
     // 1. Open Gmail compose immediately to avoid popup lifecycle issues on macOS.
     const subject = `${MAIL_SYNC_TAG} Запись Meet: ${title} (${dateStr})`;
     let body = '';
@@ -279,6 +290,26 @@ document.addEventListener('DOMContentLoaded', () => {
       document.body.removeChild(temp);
       return copied;
     }
+  }
+
+  function copyToClipboardSyncBestEffort(value) {
+    if (!value) return false;
+    const temp = document.createElement('textarea');
+    temp.value = value;
+    temp.setAttribute('readonly', '');
+    temp.style.position = 'fixed';
+    temp.style.left = '-9999px';
+    document.body.appendChild(temp);
+    temp.select();
+    const copied = document.execCommand('copy');
+    document.body.removeChild(temp);
+    return copied;
+  }
+
+  function buildLikelyDownloadPath(fileName) {
+    if (!fileName) return '';
+    if (platformOs === 'mac') return `~/Downloads/${fileName}`;
+    return fileName;
   }
 
   function downloadTranscriptAndGetPath(session, revealInFolder) {
