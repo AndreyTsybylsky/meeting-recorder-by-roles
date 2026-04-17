@@ -786,6 +786,8 @@ function injectWidget() {
       overflow-y: auto;
       padding: 16px 20px;
       border-top: 1px solid rgba(255,255,255,.06);
+      user-select: text;
+      -webkit-user-select: text;
     }
     .panel-transcript::-webkit-scrollbar { width: 4px; }
     .panel-transcript::-webkit-scrollbar-thumb { background: rgba(255,255,255,.12); border-radius: 4px; }
@@ -848,6 +850,55 @@ function injectWidget() {
   const statusEl = shadow.getElementById('status');
   const statusText = statusEl.querySelector('.status-text');
   const transcriptPreview = shadow.getElementById('transcriptPreview');
+
+  function legacyCopyToClipboard(text) {
+    const textarea = document.createElement('textarea');
+    textarea.value = text;
+    textarea.setAttribute('readonly', '');
+    textarea.style.position = 'fixed';
+    textarea.style.top = '-9999px';
+    document.body.appendChild(textarea);
+    textarea.focus();
+    textarea.select();
+    try {
+      document.execCommand('copy');
+    } finally {
+      document.body.removeChild(textarea);
+    }
+  }
+
+  function getSelectedTranscriptText() {
+    const selection = typeof shadow.getSelection === 'function'
+      ? shadow.getSelection()
+      : window.getSelection();
+
+    if (!selection || selection.rangeCount === 0) return '';
+
+    const selectedText = selection.toString().trim();
+    if (!selectedText) return '';
+
+    const anchorNode = selection.anchorNode;
+    if (anchorNode && !transcriptPreview.contains(anchorNode)) return '';
+
+    return selectedText;
+  }
+
+  shadow.addEventListener('keydown', (event) => {
+    const key = (event.key || '').toLowerCase();
+    const isCopyShortcut = (event.ctrlKey || event.metaKey) && !event.altKey && key === 'c';
+    if (!isCopyShortcut) return;
+
+    const selectedText = getSelectedTranscriptText();
+    if (!selectedText) return;
+
+    event.preventDefault();
+
+    if (navigator.clipboard && window.isSecureContext) {
+      navigator.clipboard.writeText(selectedText).catch(() => legacyCopyToClipboard(selectedText));
+    } else {
+      legacyCopyToClipboard(selectedText);
+    }
+  });
 
   let panelOpen = false;
 
