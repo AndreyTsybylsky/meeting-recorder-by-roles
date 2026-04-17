@@ -95,6 +95,8 @@ function destroyWidget() {
 let isRecording = false;
 let transcript = []; // Array of { id: string, name: string, text: string }
 let currentSessionId = null;
+let storageStateInitialized = false;
+let storageStateTouchedLocally = false;
 
 // Extract meeting code from URL
 function getMeetingCode() {
@@ -381,53 +383,151 @@ const STORAGE_SCOPE = `${PLATFORM}:${getMeetingCode()}`;
 const RECORDING_STORAGE_KEY = `isRecording:${STORAGE_SCOPE}`;
 const TRANSCRIPT_STORAGE_KEY = `transcript:${STORAGE_SCOPE}`;
 
+const DEV_DEBUG_ENABLED = (() => {
+  try {
+    return !!(chrome && chrome.runtime && chrome.runtime.getManifest && !chrome.runtime.getManifest().update_url);
+  } catch (e) {
+    return false;
+  }
+})();
+
+function debugDevLog(scope, details) {
+  if (!DEV_DEBUG_ENABLED) return;
+  const suffix = details ? ` ${details}` : '';
+  console.debug(`[MeetTranscriber][dev] ${scope}${suffix}`);
+}
+
+function isExtensionContextAvailable() {
+  try {
+    return !!(chrome && chrome.runtime && chrome.runtime.id && chrome.storage && chrome.storage.local);
+  } catch (e) {
+    debugDevLog('context-check', 'threw while checking extension context');
+    return false;
+  }
+}
+
+function safeStorageSet(payload, callback) {
+  if (!isExtensionContextAvailable()) {
+    debugDevLog('storage.set', 'skipped: extension context unavailable');
+    if (typeof callback === 'function') callback();
+    return;
+  }
+
+  try {
+    chrome.storage.local.set(payload, () => {
+      if (typeof callback === 'function') callback();
+    });
+  } catch (e) {
+    debugDevLog('storage.set', `failed: ${e && e.message ? e.message : 'unknown error'}`);
+    if (typeof callback === 'function') callback();
+  }
+}
+
+function safeStorageGet(keys, callback) {
+  if (!isExtensionContextAvailable()) {
+    debugDevLog('storage.get', 'skipped: extension context unavailable');
+    callback({});
+    return;
+  }
+
+  try {
+    chrome.storage.local.get(keys, (res) => {
+      callback(res || {});
+    });
+  } catch (e) {
+    debugDevLog('storage.get', `failed: ${e && e.message ? e.message : 'unknown error'}`);
+    callback({});
+  }
+}
+
+function safeSendMessage(message, callback) {
+  if (!isExtensionContextAvailable()) {
+    debugDevLog('runtime.sendMessage', 'skipped: extension context unavailable');
+    if (typeof callback === 'function') callback(false);
+    return;
+  }
+
+  try {
+    chrome.runtime.sendMessage(message, () => {
+      if (typeof callback === 'function') {
+        let ok = true;
+        try {
+          ok = !chrome.runtime.lastError;
+          if (!ok) {
+            debugDevLog('runtime.sendMessage', `runtime.lastError: ${chrome.runtime.lastError.message || 'unknown'}`);
+          }
+        } catch (e) {
+          debugDevLog('runtime.sendMessage', 'failed while reading runtime.lastError');
+          ok = false;
+        }
+        callback(ok);
+      }
+    });
+  } catch (e) {
+    debugDevLog('runtime.sendMessage', `failed: ${e && e.message ? e.message : 'unknown error'}`);
+    if (typeof callback === 'function') callback(false);
+  }
+}
+
 function setScopedRecordingState(nextIsRecording, nextTranscript) {
-  chrome.storage.local.set({
+  storageStateTouchedLocally = true;
+  safeStorageSet({
     [RECORDING_STORAGE_KEY]: nextIsRecording,
     [TRANSCRIPT_STORAGE_KEY]: nextTranscript
   });
 }
 
 // ── Persistence ─────────────────────────────────────────────
-chrome.storage.local.get([RECORDING_STORAGE_KEY, TRANSCRIPT_STORAGE_KEY, 'isRecording', 'transcript'], (res) => {
+safeStorageGet([RECORDING_STORAGE_KEY, TRANSCRIPT_STORAGE_KEY, 'isRecording', 'transcript'], (res) => {
   const scopedIsRecording = res[RECORDING_STORAGE_KEY];
   const scopedTranscript = res[TRANSCRIPT_STORAGE_KEY];
 
-  if (scopedIsRecording !== undefined) {
-    isRecording = scopedIsRecording;
-  } else if (res.isRecording !== undefined) {
-    // Migrate legacy global state into scoped state for this meeting context.
-    isRecording = res.isRecording;
-    chrome.storage.local.set({ [RECORDING_STORAGE_KEY]: isRecording });
+  // If the user already toggled recording locally, don't overwrite state with stale async read.
+  if (!storageStateTouchedLocally) {
+    if (scopedIsRecording !== undefined) {
+      isRecording = scopedIsRecording;
+    } else if (res.isRecording !== undefined) {
+      // Migrate legacy global state into scoped state for this meeting context.
+      isRecording = res.isRecording;
+      safeStorageSet({ [RECORDING_STORAGE_KEY]: isRecording });
+    }
+
+    if (Array.isArray(scopedTranscript)) {
+      transcript = scopedTranscript;
+    } else if (Array.isArray(res.transcript)) {
+      transcript = res.transcript;
+      safeStorageSet({ [TRANSCRIPT_STORAGE_KEY]: transcript });
+    }
   }
 
-  if (Array.isArray(scopedTranscript)) {
-    transcript = scopedTranscript;
-  } else if (Array.isArray(res.transcript)) {
-    transcript = res.transcript;
-    chrome.storage.local.set({ [TRANSCRIPT_STORAGE_KEY]: transcript });
-  }
-
+  storageStateInitialized = true;
   refreshUI();
 });
 
-chrome.storage.onChanged.addListener((changes, area) => {
-  if (area === 'local') {
-    if (changes[RECORDING_STORAGE_KEY] !== undefined) {
-      isRecording = changes[RECORDING_STORAGE_KEY].newValue;
-    }
-    if (changes[TRANSCRIPT_STORAGE_KEY] !== undefined) {
-      transcript = changes[TRANSCRIPT_STORAGE_KEY].newValue;
-    }
-    refreshUI();
+if (isExtensionContextAvailable()) {
+  try {
+    chrome.storage.onChanged.addListener((changes, area) => {
+      if (area === 'local') {
+        if (changes[RECORDING_STORAGE_KEY] !== undefined) {
+          isRecording = changes[RECORDING_STORAGE_KEY].newValue;
+        }
+        if (changes[TRANSCRIPT_STORAGE_KEY] !== undefined) {
+          transcript = changes[TRANSCRIPT_STORAGE_KEY].newValue;
+        }
+        refreshUI();
+      }
+    });
+  } catch (e) {
+    debugDevLog('storage.onChanged', `listener registration skipped: ${e && e.message ? e.message : 'unknown error'}`);
   }
-});
+}
 
 let saveTimeout;
 function saveTranscript() {
+  storageStateTouchedLocally = true;
   clearTimeout(saveTimeout);
   saveTimeout = setTimeout(() => {
-    chrome.storage.local.set({ [TRANSCRIPT_STORAGE_KEY]: transcript });
+    safeStorageSet({ [TRANSCRIPT_STORAGE_KEY]: transcript });
     refreshUI();
   }, 500);
 }
@@ -485,20 +585,19 @@ function finalizeSession() {
     transcript: merged
   };
   
-  // Send to background for persistent storage
-  try {
-    chrome.runtime.sendMessage({ type: 'SAVE_SESSION', session });
-  } catch (e) {
-    // Extension context may be invalidated, save directly
-    chrome.storage.local.get(['sessions'], (res) => {
+  // Send to background for persistent storage, fallback to local list if messaging fails.
+  safeSendMessage({ type: 'SAVE_SESSION', session }, (ok) => {
+    if (ok) return;
+
+    safeStorageGet(['sessions'], (res) => {
       const sessions = res.sessions || [];
       const idx = sessions.findIndex(s => s.id === session.id);
       if (idx >= 0) sessions[idx] = session;
       else sessions.unshift(session);
       if (sessions.length > 50) sessions.length = 50;
-      chrome.storage.local.set({ sessions });
+      safeStorageSet({ sessions });
     });
-  }
+  });
 }
 
 // Auto-save when leaving the page or meeting ends
@@ -941,6 +1040,8 @@ function injectWidget() {
   });
 
   toggleRecordBtn.addEventListener('click', () => {
+    if (!storageStateInitialized) return;
+
     const newState = !isRecording;
     isRecording = newState;
     
@@ -949,6 +1050,7 @@ function injectWidget() {
       currentSessionId = Date.now().toString();
       // Clear transcript for a fresh start if it wasn't already cleared
       transcript = []; 
+      ensureCaptionObserverAttached();
       setScopedRecordingState(true, []);
       setPanelOpen(false);
     } else {
@@ -1001,13 +1103,26 @@ function injectWidget() {
   clearBtn.addEventListener('click', () => {
     if (confirm('Очистить текущий экран? История сессий сохранится.')) {
       transcript = [];
-      chrome.storage.local.set({ [TRANSCRIPT_STORAGE_KEY]: [] });
+      safeStorageSet({ [TRANSCRIPT_STORAGE_KEY]: [] });
       refreshUI();
     }
   });
 
   // ── Expose refreshUI globally within this script ──
   window.__meetTranscriberRefreshUI = function () {
+    if (!storageStateInitialized) {
+      statusEl.classList.remove('recording');
+      statusText.textContent = 'Инициализация...';
+      toggleRecordBtn.textContent = 'Подготовка...';
+      toggleRecordBtn.className = 'btn btn-secondary';
+      toggleRecordBtn.disabled = true;
+      downloadBtn.disabled = true;
+      clearBtn.disabled = true;
+      return;
+    }
+
+    toggleRecordBtn.disabled = false;
+
     // Status
     if (isRecording) {
       statusEl.classList.add('recording');
