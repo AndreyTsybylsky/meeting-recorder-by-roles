@@ -1,7 +1,35 @@
 // ============================================================
 // Meet Transcriber — Content Script
-// Captures Google Meet captions + provides a floating in-page UI
+// Captures meeting captions (Google Meet + Microsoft Teams)
 // ============================================================
+
+const PLATFORM = detectPlatform();
+
+const CAPTION_SELECTORS = {
+  meet: {
+    container: 'div[jsname="W297wb"], .iY996, .V006ub, .nS7Zeb, .nMcdL, [jsname="YSZ4cc"]',
+    block: 'div[jsname="W297wb"], .iY996, .V006ub, .nS7Zeb',
+    name: '.KcIKyf, .adE6rb, .NWpY1d, [jsname="IT69ne"]',
+    text: '.nMcdL, .ygicle, [jsname="YSZ4cc"], [jsname="Vpvi7b"]'
+  },
+  teams: {
+    container: '[data-tid*="caption" i], [class*="caption" i], [class*="closed-caption" i]',
+    block: '[data-tid*="caption-item" i], [data-tid*="caption" i], [class*="caption-item" i], [class*="closed-caption" i]',
+    name: '[data-tid*="caption-speaker" i], [data-tid*="speaker" i], [class*="captionSpeaker" i], [class*="speaker" i]',
+    text: '[data-tid*="caption-text" i], [data-tid*="caption-line" i], [class*="captionText" i], [class*="caption-text" i]'
+  }
+};
+
+function detectPlatform() {
+  const host = window.location.hostname;
+  if (host.includes('meet.google.com')) return 'meet';
+  if (host.includes('teams.microsoft.com')) return 'teams';
+  return 'unknown';
+}
+
+function getCaptionConfig() {
+  return CAPTION_SELECTORS[PLATFORM] || CAPTION_SELECTORS.meet;
+}
 
 let isRecording = false;
 let transcript = []; // Array of { id: string, name: string, text: string }
@@ -9,8 +37,18 @@ let currentSessionId = null;
 
 // Extract meeting code from URL
 function getMeetingCode() {
-  const match = window.location.pathname.match(/\/([a-z]{3}-[a-z]{4}-[a-z]{3})/);
-  return match ? match[1] : 'unknown';
+  if (PLATFORM === 'meet') {
+    const match = window.location.pathname.match(/\/([a-z]{3}-[a-z]{4}-[a-z]{3})/);
+    return match ? match[1] : 'unknown';
+  }
+
+  if (PLATFORM === 'teams') {
+    const path = window.location.pathname || '';
+    const match = path.match(/\/meetup-join\/([^\/]+)/i) || path.match(/\/l\/meetup-join\/([^\/]+)/i);
+    return match ? match[1] : 'teams-session';
+  }
+
+  return 'unknown';
 }
 
 let memoizedMeetingTitle = null;
@@ -42,6 +80,14 @@ function cleanTitle(str) {
 function getMeetingTitle() {
   if (memoizedMeetingTitle) return memoizedMeetingTitle;
 
+  if (PLATFORM === 'teams') {
+    const teamsTitle = getTeamsMeetingTitle();
+    if (teamsTitle) {
+      memoizedMeetingTitle = teamsTitle;
+      return teamsTitle;
+    }
+  }
+
   // 1. Try to get title from the page DOM (bottom left corner)
   const titleEl = document.querySelector('[data-meeting-title]') 
     || document.querySelector('.u6vdEc')
@@ -65,6 +111,37 @@ function getMeetingTitle() {
   }
 
   return title || getMeetingCode();
+}
+
+function getTeamsMeetingTitle() {
+  const titleCandidates = [
+    document.querySelector('[data-tid="meeting-title"]'),
+    document.querySelector('[data-tid*="meeting-title" i]'),
+    document.querySelector('[data-tid*="call-title" i]'),
+    document.querySelector('[class*="meeting-title" i]')
+  ];
+
+  for (const el of titleCandidates) {
+    if (!el || !el.textContent) continue;
+    const candidate = cleanTitle(el.textContent);
+    if (candidate && candidate.length > 2) {
+      return candidate;
+    }
+  }
+
+  const docTitle = document.title || '';
+  const normalized = cleanTitle(
+    docTitle
+      .replace(/\|\s*Microsoft Teams.*/i, '')
+      .replace(/\s*-\s*Microsoft Teams.*/i, '')
+      .replace(/^Microsoft Teams\s*-\s*/i, '')
+  );
+
+  if (normalized && normalized.length > 2 && normalized !== 'Microsoft Teams') {
+    return normalized;
+  }
+
+  return null;
 }
 
 function isRealName(name) {
@@ -244,14 +321,20 @@ setInterval(() => {
        finalizeSession();
     }
 
-    // 2. Check if meeting ended (Leave button gone or "You left" screen appears)
-    const leaveBtn = document.querySelector('[aria-label*="Leave"], [aria-label*="встречу"], [aria-label*="Покинуть"]');
-    const endedScreen = document.querySelector('[data-termination-message], .V006ub, .J57M8c'); 
-    
-    // If the meeting UI is gone but we are still "recording", stop it.
-    // We check if either the leave button is gone OR the end screen is visible.
-    // Note: We check for leaveBtn ONLY if some other meeting elements are also missing to avoid false positives during loading.
-    const meetingContainer = document.querySelector('.view-container, .wrapper, .a4cQT');
+    // 2. Check if meeting ended.
+    let leaveBtn;
+    let endedScreen;
+    let meetingContainer;
+
+    if (PLATFORM === 'teams') {
+      leaveBtn = document.querySelector('[data-tid*="hangup" i], button[aria-label*="Leave" i], button[aria-label*="Покинуть" i]');
+      endedScreen = document.querySelector('[data-tid*="call-ended" i], [data-tid*="meeting-ended" i]');
+      meetingContainer = document.querySelector('[data-tid*="calling" i], [data-tid*="meeting-stage" i], [data-tid*="roster" i]');
+    } else {
+      leaveBtn = document.querySelector('[aria-label*="Leave"], [aria-label*="встречу"], [aria-label*="Покинуть"]');
+      endedScreen = document.querySelector('[data-termination-message], .V006ub, .J57M8c');
+      meetingContainer = document.querySelector('.view-container, .wrapper, .a4cQT');
+    }
     
     if ((!leaveBtn && !meetingContainer) || endedScreen) {
       console.log('Meet Transcriber: Meeting end detected. Saving and stopping.');
@@ -263,6 +346,8 @@ setInterval(() => {
 const captionObserver = new MutationObserver((mutations) => {
   if (!isRecording) return;
 
+  const captionConfig = getCaptionConfig();
+
   const processedContainers = new Set();
 
   for (const mutation of mutations) {
@@ -272,18 +357,18 @@ const captionObserver = new MutationObserver((mutations) => {
 
     // Search for the wrapper that contains speech (and hopefully speaker)
     // We look for common Meet caption segment containers
-    const container = element.closest('div[jsname="W297wb"], .iY996, .V006ub, .nS7Zeb, .nMcdL, [jsname="YSZ4cc"]');
+    const container = element.closest(captionConfig.container);
     if (!container) continue;
     
     // We want the HIGHEST level container that still represents this specific speaker block
-    const blockContainer = container.closest('div[jsname="W297wb"], .iY996, .V006ub, .nS7Zeb') || container;
+    const blockContainer = container.closest(captionConfig.block) || container;
     
     if (processedContainers.has(blockContainer)) continue;
     processedContainers.add(blockContainer);
 
     // Find speaker and text elements
-    const nameEl = blockContainer.querySelector('.KcIKyf, .adE6rb, .NWpY1d, [jsname="IT69ne"]');
-    const textEl = blockContainer.querySelector('.nMcdL, .ygicle, [jsname="YSZ4cc"], [jsname="Vpvi7b"]');
+    const nameEl = blockContainer.querySelector(captionConfig.name);
+    const textEl = blockContainer.querySelector(captionConfig.text);
 
     if (textEl) {
       let speechText = textEl.textContent.trim();
@@ -327,6 +412,7 @@ captionObserver.observe(document.body, { childList: true, subtree: true, charact
 // ── Floating Widget (Shadow DOM) ────────────────────────────
 
 function injectWidget() {
+  const widgetTitle = PLATFORM === 'teams' ? '📝 Teams Transcriber' : '📝 Meet Transcriber';
   const host = document.createElement('div');
   host.id = 'meet-transcriber-host';
   document.body.appendChild(host);
@@ -524,7 +610,7 @@ function injectWidget() {
     </button>
     <div class="panel" id="panel">
       <div class="panel-header">
-        <h2>📝 Meet Transcriber</h2>
+        <h2>${widgetTitle}</h2>
         <div class="status" id="status">
           <span class="dot"></span>
           <span class="status-text">Ожидание...</span>
