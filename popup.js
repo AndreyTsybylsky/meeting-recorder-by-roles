@@ -209,7 +209,18 @@ document.addEventListener('DOMContentLoaded', () => {
     const speakerCount = new Set(s.transcript.map(t => t.name)).size;
     const fileName = title.replace(/[<>:"/\\|?*]/g, '_') + '.txt';
 
-    // 1. Auto-download transcript as .txt and copy the full path when completed
+    // 1. Open Gmail compose immediately to avoid popup lifecycle issues on macOS.
+    const subject = `${MAIL_SYNC_TAG} Запись Meet: ${title} (${dateStr})`;
+    let body = '';
+    body += `${MAIL_SYNC_TAG}\n`;
+    body += `MR_SESSION_ID: ${s.id || 'unknown'}\n\n`;
+    if (comment) body += `${comment}\n\n`;
+    body += `Встреча: ${title}\nДата: ${dateStr} в ${timeStr}\nУчастников: ${speakerCount} · Реплик: ${s.transcript.length}\n\nТранскрипт во вложении: ${fileName}`;
+
+    const gmailUrl = `https://mail.google.com/mail/?view=cm&to=${encodeURIComponent(to)}&su=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+    chrome.tabs.create({ url: gmailUrl });
+
+    // 2. Auto-download transcript as .txt and copy the full path when completed
     const fullPath = await downloadTranscriptAndGetPath(s, false);
     if (!fullPath) {
       emailPathHint.textContent = 'Ошибка скачивания файла';
@@ -227,16 +238,6 @@ document.addEventListener('DOMContentLoaded', () => {
       }
     }
 
-    // 2. Open Gmail compose with short body only (no transcript in URL)
-    const subject = `${MAIL_SYNC_TAG} Запись Meet: ${title} (${dateStr})`;
-    let body = '';
-    body += `${MAIL_SYNC_TAG}\n`;
-    body += `MR_SESSION_ID: ${s.id || 'unknown'}\n\n`;
-    if (comment) body += `${comment}\n\n`;
-    body += `Встреча: ${title}\nДата: ${dateStr} в ${timeStr}\nУчастников: ${speakerCount} · Реплик: ${s.transcript.length}\n\nТранскрипт во вложении: ${fileName}`;
-
-    const gmailUrl = `https://mail.google.com/mail/?view=cm&to=${encodeURIComponent(to)}&su=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
-    chrome.tabs.create({ url: gmailUrl });
   }
 
   function deleteSession(sessionId) {
