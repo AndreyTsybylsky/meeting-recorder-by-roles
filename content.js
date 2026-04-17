@@ -13,17 +13,17 @@ const CAPTION_SELECTORS = {
     text: '.nMcdL, .ygicle, [jsname="YSZ4cc"], [jsname="Vpvi7b"]'
   },
   teams: {
-    container: '[data-tid*="caption" i], [class*="caption" i], [class*="closed-caption" i]',
-    block: '[data-tid*="caption-item" i], [data-tid*="caption" i], [class*="caption-item" i], [class*="closed-caption" i]',
-    name: '[data-tid*="caption-speaker" i], [data-tid*="speaker" i], [class*="captionSpeaker" i], [class*="speaker" i]',
-    text: '[data-tid*="caption-text" i], [data-tid*="caption-line" i], [class*="captionText" i], [class*="caption-text" i]'
+    container: '[data-tid="closed-captions-v2-items-renderer"], [data-tid="closed-caption-text"], [data-tid="author"], [data-tid="closed-caption-renderer-wrapper"]',
+    block: '[data-tid="closed-captions-v2-items-renderer"], .fui-ChatMessageCompact',
+    name: '[data-tid="author"], .fui-ChatMessageCompact__author, [data-tid*="caption-speaker" i]',
+    text: '[data-tid="closed-caption-text"], [data-tid*="caption-text" i], .fui-ChatMessageCompact__body'
   }
 };
 
 function detectPlatform() {
   const host = window.location.hostname;
   if (host.includes('meet.google.com')) return 'meet';
-  if (host.includes('teams.microsoft.com')) return 'teams';
+  if (host.includes('teams.microsoft.com') || host.includes('teams.live.com')) return 'teams';
   return 'unknown';
 }
 
