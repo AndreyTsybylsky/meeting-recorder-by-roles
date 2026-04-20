@@ -45,16 +45,28 @@ function shouldShowWidget() {
   }
 
   if (PLATFORM === 'teams') {
+    // On Mac / new Teams the meeting URL lives in the hash fragment (#/l/meetup-join/…),
+    // so we must check both pathname and hash.
     const path = (window.location.pathname || '').toLowerCase();
-    const looksLikeMeetingPath = /\/meet\//.test(path) || /\/meetup-join\//.test(path) || /\/l\/meetup-join\//.test(path);
+    const hash = (window.location.hash || '').toLowerCase();
+    const fullPath = path + hash;
+    const looksLikeMeetingPath =
+      /\/meet\//.test(fullPath) ||
+      /\/meetup-join\//.test(fullPath) ||
+      /\/l\/meetup-join\//.test(fullPath) ||
+      /\/pre-join\//.test(fullPath) ||
+      /\/meeting\//.test(fullPath);
     const hasCallControls = !!document.querySelector(
-      '[data-tid*="hangup" i], [data-tid*="microphone" i], [data-tid*="camera" i], [data-tid*="share" i], button[aria-label*="Leave" i], button[aria-label*="Покинуть" i]'
+      '[data-tid*="hangup" i], [data-tid*="microphone" i], [data-tid*="camera" i], [data-tid*="share" i], button[aria-label*="Leave" i], button[aria-label*="Покинуть" i], button[aria-label*="Hang up" i], button[aria-label*="Mute" i], button[aria-label*="Unmute" i]'
     );
     const hasMeetingSurface = !!document.querySelector(
-      '[data-tid*="meeting-stage" i], [data-tid*="calling" i], [data-tid="closed-caption-renderer-wrapper"], [data-tid="closed-captions-v2-items-renderer"]'
+      '[data-tid*="meeting-stage" i], [data-tid*="calling" i], [data-tid="closed-caption-renderer-wrapper"], [data-tid="closed-captions-v2-items-renderer"], [data-tid*="video-gallery" i], [data-tid*="roster" i]'
     );
 
-    return looksLikeMeetingPath && (hasCallControls || hasMeetingSurface);
+    // Show the widget if the path matches OR if Teams call UI elements are present.
+    // On Mac/new Teams, hash-routing can make path detection unreliable,
+    // so DOM-based detection alone is sufficient.
+    return looksLikeMeetingPath || hasCallControls || hasMeetingSurface;
   }
 
   if (PLATFORM === 'zoom') {
@@ -106,8 +118,8 @@ function getMeetingCode() {
   }
 
   if (PLATFORM === 'teams') {
-    const path = window.location.pathname || '';
-    const match = path.match(/\/meetup-join\/([^\/]+)/i) || path.match(/\/l\/meetup-join\/([^\/]+)/i);
+    const path = (window.location.pathname || '') + (window.location.hash || '');
+    const match = path.match(/\/meetup-join\/([^\/&#]+)/i) || path.match(/\/l\/meetup-join\/([^\/&#]+)/i) || path.match(/\/meet\/([^\/&#]+)/i);
     return match ? match[1] : 'teams-session';
   }
 
