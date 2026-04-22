@@ -63,7 +63,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
-  function queryRecordingState(tabId) {
+  function queryRecordingState(tabId, retries) {
     chrome.tabs.sendMessage(tabId, { type: 'GET_RECORDING_STATE' }, (response) => {
       if (chrome.runtime.lastError || !response) {
         // Content script not injected yet or tab doesn't support it
@@ -72,7 +72,11 @@ document.addEventListener('DOMContentLoaded', () => {
         return;
       }
       activeMeetingTabId = tabId;
-      updateRecordStrip(response.isRecording, !response.initialized);
+      updateRecordStrip(response.isRecording, false);
+      // If storage hasn't been read yet, retry a few times so auto-record shows up
+      if (!response.initialized && (retries || 0) < 5) {
+        setTimeout(() => queryRecordingState(tabId, (retries || 0) + 1), 400);
+      }
     });
   }
 

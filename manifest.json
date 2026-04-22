@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Meet Transcriber",
-  "version": "1.1",
+  "version": "1.2",
   "description": "Records Google Meet closed captions and saves them to a text file.",
   "permissions": [
     "storage",
@@ -29,6 +29,18 @@
     {
       "matches": ["*://meet.google.com/*", "*://teams.microsoft.com/*", "*://teams.live.com/*", "*://zoom.us/*", "*://*.zoom.us/*"],
       "js": ["content.js"]
+    },
+    {
+      "matches": ["*://meet.google.com/*"],
+      "js": ["googlemeet-capture.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["*://teams.microsoft.com/*", "*://teams.live.com/*"],
+      "js": ["teams-capture.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
     }
   ]
 }

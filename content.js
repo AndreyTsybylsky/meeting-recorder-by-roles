@@ -19,10 +19,54 @@ const CAPTION_SELECTORS = {
     text: '[data-tid="closed-caption-text"], [data-tid*="caption-text" i], .fui-ChatMessageCompact__body'
   },
   zoom: {
-    container: '#live-transcription-subtitle, .live-transcription-subtitle__box, .live-transcription-subtitle__item, [aria-live="polite"], [aria-live="assertive"], [data-testid*="caption" i], [data-testid*="transcript" i], [class*="caption" i], [class*="transcript" i]',
-    block: '#live-transcription-subtitle, .live-transcription-subtitle__box, .live-transcription-subtitle__item, [data-testid*="caption-message" i], [data-testid*="transcript-message" i], [class*="caption-message" i], [class*="transcript-message" i], [class*="caption-item" i], [class*="transcript-item" i]',
-    name: '[data-testid*="speaker" i], .speaker-active-container__wrap, [class*="speaker" i], [class*="name" i]',
-    text: '.live-transcription-subtitle__item, #live-transcription-subtitle, [data-testid*="caption-text" i], [data-testid*="transcript-text" i], [class*="caption-text" i], [class*="transcript-text" i], [class*="subtitle" i], [class*="caption-line" i], [class*="caption-content" i]'
+    // Broad container: catches both the classic subtitle div and newer aria-live regions
+    container: [
+      '#live-transcription-subtitle',
+      '.live-transcription-subtitle__box',
+      '.live-transcription-subtitle__item',
+      '[aria-live="assertive"]',
+      '[aria-live="polite"]',
+      '[data-testid*="caption" i]',
+      '[data-testid*="transcript" i]',
+      '[class*="caption" i]',
+      '[class*="transcript" i]',
+      '[id*="subtitle" i]',
+      '[id*="caption" i]',
+      '[id*="transcript" i]'
+    ].join(', '),
+    block: [
+      '#live-transcription-subtitle',
+      '.live-transcription-subtitle__box',
+      '.live-transcription-subtitle__item',
+      '[data-testid*="caption-message" i]',
+      '[data-testid*="transcript-message" i]',
+      '[class*="caption-message" i]',
+      '[class*="transcript-message" i]',
+      '[class*="caption-item" i]',
+      '[class*="transcript-item" i]',
+      '[class*="subtitle-item" i]',
+      '[id*="caption-item" i]'
+    ].join(', '),
+    name: [
+      '[data-testid*="speaker" i]',
+      '.speaker-active-container__wrap',
+      '[class*="speaker-name" i]',
+      '[class*="participant-name" i]',
+      '[class*="display-name" i]',
+      '[class*="user-name" i]',
+      '[class*="speaker" i]'
+    ].join(', '),
+    text: [
+      '.live-transcription-subtitle__item',
+      '[data-testid*="caption-text" i]',
+      '[data-testid*="transcript-text" i]',
+      '[class*="caption-text" i]',
+      '[class*="transcript-text" i]',
+      '[class*="subtitle-text" i]',
+      '[class*="caption-line" i]',
+      '[class*="caption-content" i]',
+      '[class*="caption-body" i]'
+    ].join(', ')
   }
 };
 
@@ -111,6 +155,10 @@ let storageStateInitialized = false;
 let storageStateTouchedLocally = false;
 let sidebarEnabled = false;    // off by default for stealth; user enables via popup
 let autoRecordEnabled = true;  // record automatically on join; user can disable via popup
+// Guard: only trigger "meeting ended" detection after the meeting container has been
+// seen at least once. Prevents false-positive stopAndSave() on initial page load
+// before the meeting UI finishes rendering (Teams SPA issue).
+let meetingContainerEverSeen = false;
 
 // Extract meeting code from URL
 function getMeetingCode() {
@@ -576,7 +624,10 @@ if (isExtensionContextAvailable()) {
           transcript = [];
           ensureCaptionObserverAttached();
           setScopedRecordingState(true, []);
-          setPanelOpen(false);
+          // Close the transcript panel if the widget is already injected
+          if (typeof window.__meetTranscriberSetPanelOpen === 'function') {
+            window.__meetTranscriberSetPanelOpen(false);
+          }
         } else {
           finalizeSession();
           transcript = [];
@@ -710,7 +761,10 @@ setInterval(() => {
       meetingContainer = document.querySelector('.view-container, .wrapper, .a4cQT');
     }
     
-    if ((!leaveBtn && !meetingContainer) || endedScreen) {
+    // Track when we first see the meeting container so we don't false-fire on load
+    if (meetingContainer || leaveBtn) meetingContainerEverSeen = true;
+
+    if (meetingContainerEverSeen && ((!leaveBtn && !meetingContainer) || endedScreen)) {
       console.log('Meet Transcriber: Meeting end detected. Saving and stopping.');
       stopAndSave();
     }
@@ -807,6 +861,156 @@ function ensureCaptionObserverAttached() {
 }
 
 ensureCaptionObserverAttached();
+
+// ── Zoom aria-live periodic scan (fallback) ──────────────────
+// Zoom sometimes replaces entire subtitle DOM subtrees rather than mutating
+// text in place, which can cause MutationObserver to fire on the wrong level.
+// This scanner directly reads all aria-live regions every 600 ms as a safety net.
+if (PLATFORM === 'zoom') {
+  const zoomAriaLiveCache = new Map(); // element → last seen text
+
+  setInterval(() => {
+    if (!isRecording) return;
+
+    const root = getCaptionObservationRoot();
+    if (!root) return;
+
+    const regions = root.querySelectorAll('[aria-live], [aria-atomic="true"]');
+    regions.forEach(el => {
+      const raw = (el.textContent || '').replace(/\s+/g, ' ').trim();
+      if (!raw || raw.length < 3 || raw.length > 400) return;
+
+      // Skip if unchanged since last scan
+      if (zoomAriaLiveCache.get(el) === raw) return;
+      zoomAriaLiveCache.set(el, raw);
+
+      // Try to resolve a speaker name from a sibling/parent name element
+      const captionConfig = getCaptionConfig();
+      const nameEl = el.querySelector(captionConfig.name) ||
+                     el.closest('[class*="caption-item" i], [class*="subtitle-item" i]')?.querySelector(captionConfig.name);
+      let speakerName = nameEl ? (nameEl.textContent || '').trim() : '';
+      if (!speakerName || !isRealName(speakerName)) {
+        speakerName = getZoomActiveSpeakerName() || getUserRealName() || 'Speaker';
+      }
+
+      const text = sanitizeZoomSpeechText(raw);
+      if (!text) return;
+
+      // Stable ID based on the region's class/id
+      const elId = 'zoom-live-' + (el.id || el.className || '').replace(/\s+/g, '-').slice(0, 48);
+
+      const existing = transcript.find(e => e.id === elId);
+      if (existing) {
+        if (existing.text !== text) { existing.text = text; existing.name = speakerName; saveTranscript(); }
+      } else {
+        transcript.push({ id: elId, name: speakerName, text });
+        saveTranscript();
+      }
+    });
+  }, 600);
+}
+
+// ── Google Meet RTC Caption Capture ────────────────────────
+// googlemeet-capture.js (MAIN world) intercepts the WebRTC 'captions'
+// data channel and dispatches __mt_meet_caption events.
+// It also fills meetDeviceMap via __mt_meet_device events from the
+// 'collections' channel and the SyncMeetingSpaceCollections HTTP call.
+const meetDeviceMap = {}; // '@deviceId' → displayName
+
+if (PLATFORM === 'meet') {
+  document.addEventListener('__mt_meet_device', (evt) => {
+    const { deviceId, deviceName } = evt.detail || {};
+    if (deviceId && deviceName) {
+      meetDeviceMap[deviceId] = deviceName;
+      debugDevLog('meet-device', `${deviceId} → ${deviceName}`);
+    }
+  });
+
+  document.addEventListener('__mt_meet_caption', (evt) => {
+    if (!isRecording) return;
+    const { deviceId, messageId, messageVersion, text } = evt.detail || {};
+    if (!text || !messageId) return;
+
+    // Resolve display name from the device map (populated before first caption arrives)
+    let speakerName = meetDeviceMap[deviceId] || '';
+    if (!speakerName || !isRealName(speakerName)) {
+      speakerName = getUserRealName() || 'Speaker';
+    }
+
+    const cleanText = sanitizeSpeechText(speakerName, text.trim());
+    if (!cleanText) return;
+
+    const existing = transcript.find(e => e.id === messageId);
+    if (existing) {
+      // Update if this version has newer/longer text
+      const existingVer = existing._rtcVersion || 0;
+      if (messageVersion > existingVer && existing.text !== cleanText) {
+        existing.text = cleanText;
+        existing.name = speakerName;
+        existing._rtcVersion = messageVersion;
+        saveTranscript();
+      }
+    } else {
+      transcript.push({ id: messageId, name: speakerName, text: cleanText, _rtcVersion: messageVersion });
+      saveTranscript();
+    }
+  });
+}
+
+// ── Teams WebRTC Caption Fallback ───────────────────────────
+// When the Teams caption panel is closed the DOM emits no mutations.
+// teams-capture.js (MAIN world) intercepts the WebRTC main-channel and
+// dispatches __mt_teams_caption events so we can still capture speech.
+if (PLATFORM === 'teams') {
+  document.addEventListener('__mt_teams_caption', (evt) => {
+    if (!isRecording) return;
+
+    // Only use this path when the DOM caption panel is absent.
+    // When the panel is open, our MutationObserver already handles it.
+    const domPanelActive = !!document.querySelector(
+      '[data-tid="closed-captions-v2-items-renderer"], [data-tid="closed-caption-renderer-wrapper"]'
+    );
+    if (domPanelActive) return;
+
+    const { userId, text, messageId } = evt.detail || {};
+    if (!text || !messageId) return;
+
+    // Deduplicate by messageId
+    if (transcript.find(e => e.id === messageId)) return;
+
+    // Try to resolve speaker name from Teams participant tiles.
+    // Teams often stores the MRI in data-mri / data-user-id on roster elements.
+    let speakerName = resolveTeamsSpeakerFromDom(userId);
+
+    transcript.push({ id: messageId, name: speakerName, text });
+    saveTranscript();
+  });
+}
+
+/**
+ * Attempt to map a Teams userId (MRI like "8:orgid:...") to a display name
+ * by scanning participant/roster DOM elements that Teams renders.
+ * Falls back to "Speaker" when no match is found.
+ */
+function resolveTeamsSpeakerFromDom(userId) {
+  if (!userId) return 'Speaker';
+
+  // Teams video gallery tiles and roster entries sometimes carry data-mri
+  const candidates = document.querySelectorAll('[data-mri], [data-user-id]');
+  for (const el of candidates) {
+    const mri = el.getAttribute('data-mri') || el.getAttribute('data-user-id') || '';
+    if (mri && userId.includes(mri) || mri.includes(userId)) {
+      const nameEl = el.querySelector('[class*="name" i], [data-tid*="name" i]') || el;
+      const name = (nameEl.textContent || '').trim();
+      if (name && name.length > 1 && name.length < 80) return name;
+    }
+  }
+
+  // Last-resort: show a shortened form of the userId so the user can tell
+  // speakers apart even without resolved names.
+  const shortId = userId.split(':').pop() || userId;
+  return 'Speaker (' + shortId.slice(-6) + ')';
+}
 
 // ── Floating Widget (Shadow DOM) ────────────────────────────
 
@@ -1111,6 +1315,9 @@ function injectWidget() {
     togglePanelBtn.classList.toggle('open', panelOpen);
     if (panelOpen) refreshUI();
   }
+
+  // Expose to message bridge so popup-triggered start can close the panel
+  window.__meetTranscriberSetPanelOpen = (v) => setPanelOpen(v);
 
   togglePanelBtn.addEventListener('click', () => {
     setPanelOpen(!panelOpen);
