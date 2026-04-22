@@ -25,6 +25,17 @@ document.addEventListener('DOMContentLoaded', () => {
     chrome.storage.local.set({ sidebarEnabled: sidebarToggle.checked });
   });
 
+  // Auto-record toggle (default ON — value is true when key absent)
+  const autoRecordToggle = document.getElementById('autoRecordToggle');
+
+  chrome.storage.local.get(['autoRecordEnabled'], (res) => {
+    autoRecordToggle.checked = res.autoRecordEnabled !== undefined ? !!res.autoRecordEnabled : true;
+  });
+
+  autoRecordToggle.addEventListener('change', () => {
+    chrome.storage.local.set({ autoRecordEnabled: autoRecordToggle.checked });
+  });
+
   // ── Quick-record logic ──────────────────────────────────
   const MEETING_PATTERNS = [/meet\.google\.com/i, /teams\.microsoft\.com/i, /zoom\.us\/wc\//i];
 

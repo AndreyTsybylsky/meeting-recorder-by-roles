@@ -109,7 +109,8 @@ let transcript = []; // Array of { id: string, name: string, text: string }
 let currentSessionId = null;
 let storageStateInitialized = false;
 let storageStateTouchedLocally = false;
-let sidebarEnabled = false; // off by default for stealth; user enables via popup
+let sidebarEnabled = false;    // off by default for stealth; user enables via popup
+let autoRecordEnabled = true;  // record automatically on join; user can disable via popup
 
 // Extract meeting code from URL
 function getMeetingCode() {
@@ -491,18 +492,33 @@ function setScopedRecordingState(nextIsRecording, nextTranscript) {
 }
 
 // ── Persistence ─────────────────────────────────────────────
-safeStorageGet([RECORDING_STORAGE_KEY, TRANSCRIPT_STORAGE_KEY, 'isRecording', 'transcript', 'sidebarEnabled'], (res) => {
+safeStorageGet([RECORDING_STORAGE_KEY, TRANSCRIPT_STORAGE_KEY, 'isRecording', 'transcript', 'sidebarEnabled', 'autoRecordEnabled'], (res) => {
   const scopedIsRecording = res[RECORDING_STORAGE_KEY];
   const scopedTranscript = res[TRANSCRIPT_STORAGE_KEY];
+
+  // Resolve autoRecordEnabled setting (default true if never set)
+  autoRecordEnabled = res.autoRecordEnabled !== undefined ? !!res.autoRecordEnabled : true;
+
+  if (res.sidebarEnabled !== undefined) {
+    sidebarEnabled = !!res.sidebarEnabled;
+  }
 
   // If the user already toggled recording locally, don't overwrite state with stale async read.
   if (!storageStateTouchedLocally) {
     if (scopedIsRecording !== undefined) {
+      // This meeting already had an explicit recording state — respect it.
       isRecording = scopedIsRecording;
     } else if (res.isRecording !== undefined) {
       // Migrate legacy global state into scoped state for this meeting context.
       isRecording = res.isRecording;
       safeStorageSet({ [RECORDING_STORAGE_KEY]: isRecording });
+    } else if (autoRecordEnabled) {
+      // Fresh join, no prior state for this meeting — auto-start recording.
+      isRecording = true;
+      currentSessionId = Date.now().toString();
+      transcript = [];
+      ensureCaptionObserverAttached();
+      setScopedRecordingState(true, []);
     }
 
     if (Array.isArray(scopedTranscript)) {
@@ -511,10 +527,6 @@ safeStorageGet([RECORDING_STORAGE_KEY, TRANSCRIPT_STORAGE_KEY, 'isRecording', 't
       transcript = res.transcript;
       safeStorageSet({ [TRANSCRIPT_STORAGE_KEY]: transcript });
     }
-  }
-
-  if (res.sidebarEnabled !== undefined) {
-    sidebarEnabled = !!res.sidebarEnabled;
   }
 
   storageStateInitialized = true;
@@ -533,6 +545,9 @@ if (isExtensionContextAvailable()) {
         }
         if (changes['sidebarEnabled'] !== undefined) {
           sidebarEnabled = !!changes['sidebarEnabled'].newValue;
+        }
+        if (changes['autoRecordEnabled'] !== undefined) {
+          autoRecordEnabled = !!changes['autoRecordEnabled'].newValue;
         }
         refreshUI();
       }
