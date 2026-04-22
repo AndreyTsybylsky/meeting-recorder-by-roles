@@ -505,15 +505,15 @@ safeStorageGet([RECORDING_STORAGE_KEY, TRANSCRIPT_STORAGE_KEY, 'isRecording', 't
 
   // If the user already toggled recording locally, don't overwrite state with stale async read.
   if (!storageStateTouchedLocally) {
-    if (scopedIsRecording !== undefined) {
-      // This meeting already had an explicit recording state — respect it.
-      isRecording = scopedIsRecording;
-    } else if (res.isRecording !== undefined) {
-      // Migrate legacy global state into scoped state for this meeting context.
-      isRecording = res.isRecording;
-      safeStorageSet({ [RECORDING_STORAGE_KEY]: isRecording });
+    if (scopedIsRecording === true) {
+      // Resume an in-progress recording (e.g. page reload mid-session).
+      isRecording = true;
+    } else if (scopedIsRecording === undefined && res.isRecording === true) {
+      // Migrate legacy global true state into scoped state.
+      isRecording = true;
+      safeStorageSet({ [RECORDING_STORAGE_KEY]: true });
     } else if (autoRecordEnabled) {
-      // Fresh join, no prior state for this meeting — auto-start recording.
+      // Auto-start: fresh join OR rejoining after a previous session was stopped.
       isRecording = true;
       currentSessionId = Date.now().toString();
       transcript = [];
@@ -521,11 +521,14 @@ safeStorageGet([RECORDING_STORAGE_KEY, TRANSCRIPT_STORAGE_KEY, 'isRecording', 't
       setScopedRecordingState(true, []);
     }
 
-    if (Array.isArray(scopedTranscript)) {
-      transcript = scopedTranscript;
-    } else if (Array.isArray(res.transcript)) {
-      transcript = res.transcript;
-      safeStorageSet({ [TRANSCRIPT_STORAGE_KEY]: transcript });
+    // Restore transcript only if we are resuming (not fresh auto-start).
+    if (!autoRecordEnabled || scopedIsRecording === true) {
+      if (Array.isArray(scopedTranscript)) {
+        transcript = scopedTranscript;
+      } else if (Array.isArray(res.transcript)) {
+        transcript = res.transcript;
+        safeStorageSet({ [TRANSCRIPT_STORAGE_KEY]: transcript });
+      }
     }
   }
 
@@ -1236,6 +1239,9 @@ function injectWidget() {
       transcriptPreview.scrollTop = transcriptPreview.scrollHeight;
     }
   };
+
+  // Sync UI immediately with current in-memory state (handles late injection).
+  refreshUI();
 }
 
 function escapeHTML(str) {

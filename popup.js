@@ -37,7 +37,7 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   // ── Quick-record logic ──────────────────────────────────
-  const MEETING_PATTERNS = [/meet\.google\.com/i, /teams\.microsoft\.com/i, /zoom\.us\/wc\//i];
+  const MEETING_PATTERNS = [/meet\.google\.com/i, /teams\.microsoft\.com/i, /teams\.live\.com/i, /zoom\.us\/wc\//i];
 
   function isMeetingUrl(url) {
     return url ? MEETING_PATTERNS.some(p => p.test(url)) : false;
