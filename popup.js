@@ -14,6 +14,17 @@ document.addEventListener('DOMContentLoaded', () => {
   const recordBtn = document.getElementById('recordBtn');
   const recordDot = document.getElementById('recordDot');
 
+  // Sidebar toggle
+  const sidebarToggle = document.getElementById('sidebarToggle');
+
+  chrome.storage.local.get(['sidebarEnabled'], (res) => {
+    sidebarToggle.checked = !!res.sidebarEnabled;
+  });
+
+  sidebarToggle.addEventListener('change', () => {
+    chrome.storage.local.set({ sidebarEnabled: sidebarToggle.checked });
+  });
+
   // ── Quick-record logic ──────────────────────────────────
   const MEETING_PATTERNS = [/meet\.google\.com/i, /teams\.microsoft\.com/i, /zoom\.us\/wc\//i];
 

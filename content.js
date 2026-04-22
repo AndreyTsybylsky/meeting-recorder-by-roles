@@ -109,6 +109,7 @@ let transcript = []; // Array of { id: string, name: string, text: string }
 let currentSessionId = null;
 let storageStateInitialized = false;
 let storageStateTouchedLocally = false;
+let sidebarEnabled = false; // off by default for stealth; user enables via popup
 
 // Extract meeting code from URL
 function getMeetingCode() {
@@ -490,7 +491,7 @@ function setScopedRecordingState(nextIsRecording, nextTranscript) {
 }
 
 // ── Persistence ─────────────────────────────────────────────
-safeStorageGet([RECORDING_STORAGE_KEY, TRANSCRIPT_STORAGE_KEY, 'isRecording', 'transcript'], (res) => {
+safeStorageGet([RECORDING_STORAGE_KEY, TRANSCRIPT_STORAGE_KEY, 'isRecording', 'transcript', 'sidebarEnabled'], (res) => {
   const scopedIsRecording = res[RECORDING_STORAGE_KEY];
   const scopedTranscript = res[TRANSCRIPT_STORAGE_KEY];
 
@@ -512,6 +513,10 @@ safeStorageGet([RECORDING_STORAGE_KEY, TRANSCRIPT_STORAGE_KEY, 'isRecording', 't
     }
   }
 
+  if (res.sidebarEnabled !== undefined) {
+    sidebarEnabled = !!res.sidebarEnabled;
+  }
+
   storageStateInitialized = true;
   refreshUI();
 });
@@ -525,6 +530,9 @@ if (isExtensionContextAvailable()) {
         }
         if (changes[TRANSCRIPT_STORAGE_KEY] !== undefined) {
           transcript = changes[TRANSCRIPT_STORAGE_KEY].newValue;
+        }
+        if (changes['sidebarEnabled'] !== undefined) {
+          sidebarEnabled = !!changes['sidebarEnabled'].newValue;
         }
         refreshUI();
       }
@@ -823,28 +831,27 @@ function injectWidget() {
     .toggle-btn {
       position: fixed;
       right: 0;
-      top: 50%;
-      transform: translateY(-50%);
+      bottom: 48px;
       z-index: 999999;
-      width: 36px;
-      height: 72px;
+      width: 18px;
+      height: 42px;
       border: none;
-      border-radius: 12px 0 0 12px;
+      border-radius: 6px 0 0 6px;
       cursor: pointer;
-      display: flex;
+      display: none; /* hidden by default — shown only when sidebarEnabled */
       align-items: center;
       justify-content: center;
-      background: linear-gradient(135deg, #6366f1, #8b5cf6);
-      color: #fff;
-      font-size: 18px;
-      box-shadow: -2px 2px 12px rgba(99,102,241,.45);
-      transition: all .25s cubic-bezier(.4,0,.2,1);
+      background: rgba(71, 85, 105, 0.50);
+      color: rgba(203, 213, 225, 0.70);
+      font-size: 10px;
+      box-shadow: -1px 1px 6px rgba(0,0,0,.30);
+      transition: all .2s ease;
       outline: none;
     }
     .toggle-btn:hover {
-      width: 42px;
-      background: linear-gradient(135deg, #818cf8, #a78bfa);
-      box-shadow: -4px 2px 20px rgba(139,92,246,.55);
+      width: 22px;
+      background: rgba(100, 116, 139, 0.75);
+      color: #e2e8f0;
     }
     .toggle-btn.open {
       right: 320px;
@@ -1164,6 +1171,10 @@ function injectWidget() {
 
   // ── Expose refreshUI globally within this script ──
   window.__meetTranscriberRefreshUI = function () {
+    // Sidebar button visibility (driven by sidebarEnabled setting)
+    togglePanelBtn.style.display = sidebarEnabled ? 'flex' : 'none';
+    if (!sidebarEnabled && panelOpen) setPanelOpen(false);
+
     if (!storageStateInitialized) {
       statusEl.classList.remove('recording');
       statusText.textContent = 'Инициализация...';

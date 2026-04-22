@@ -153,6 +153,57 @@
     }
     .record-strip.visible { display: flex; align-items: center; gap: 10px; }
 
+    /* Sidebar toggle row */
+    .sidebar-row {
+      padding: 10px 20px;
+      border-bottom: 1px solid rgba(255,255,255,.06);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .sidebar-row-label {
+      font-size: 12px;
+      color: #94a3b8;
+    }
+    .sidebar-row-hint {
+      font-size: 10px;
+      color: #475569;
+      margin-top: 2px;
+    }
+    /* Toggle switch */
+    .sw {
+      position: relative;
+      display: inline-block;
+      width: 34px;
+      height: 18px;
+      flex-shrink: 0;
+    }
+    .sw input { opacity: 0; width: 0; height: 0; }
+    .sw-slider {
+      position: absolute;
+      cursor: pointer;
+      inset: 0;
+      background: rgba(255,255,255,.1);
+      border-radius: 18px;
+      transition: background .2s;
+    }
+    .sw-slider::before {
+      content: '';
+      position: absolute;
+      width: 12px;
+      height: 12px;
+      left: 3px;
+      top: 3px;
+      background: #94a3b8;
+      border-radius: 50%;
+      transition: transform .2s, background .2s;
+    }
+    .sw input:checked + .sw-slider { background: rgba(99,102,241,.55); }
+    .sw input:checked + .sw-slider::before {
+      transform: translateX(16px);
+      background: #a78bfa;
+    }
+
     .btn-record {
       flex: 1;
       padding: 8px 14px;
@@ -429,6 +480,18 @@
   <div class="record-strip" id="recordStrip">
     <div class="record-dot" id="recordDot"></div>
     <button class="btn-record" id="recordBtn">Начать запись</button>
+  </div>
+
+  <!-- Sidebar visibility toggle -->
+  <div class="sidebar-row">
+    <div>
+      <div class="sidebar-row-label">Боковая панель в митинге</div>
+      <div class="sidebar-row-hint">Плавающая кнопка на странице встречи</div>
+    </div>
+    <label class="sw">
+      <input type="checkbox" id="sidebarToggle">
+      <span class="sw-slider"></span>
+    </label>
   </div>
 
   <div id="content"></div>
