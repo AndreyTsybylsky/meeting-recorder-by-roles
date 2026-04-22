@@ -145,6 +145,56 @@
     }
     .btn-email:hover { background: rgba(34,197,94,.2); }
 
+    /* Record strip */
+    .record-strip {
+      padding: 10px 20px;
+      border-bottom: 1px solid rgba(255,255,255,.06);
+      display: none;
+    }
+    .record-strip.visible { display: flex; align-items: center; gap: 10px; }
+
+    .btn-record {
+      flex: 1;
+      padding: 8px 14px;
+      border: none;
+      border-radius: 10px;
+      font-family: 'Inter', sans-serif;
+      font-size: 12px;
+      font-weight: 700;
+      cursor: pointer;
+      transition: all .15s ease;
+      outline: none;
+      background: linear-gradient(135deg, #6366f1, #8b5cf6);
+      color: #fff;
+    }
+    .btn-record:hover { filter: brightness(1.15); }
+    .btn-record.recording {
+      background: linear-gradient(135deg, #ef4444, #dc2626);
+      animation: pulse-record .9s ease-in-out infinite alternate;
+    }
+    .btn-record:disabled {
+      opacity: .5;
+      cursor: default;
+      filter: none;
+    }
+    @keyframes pulse-record {
+      from { opacity: .85; }
+      to   { opacity: 1; }
+    }
+
+    .record-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #94a3b8;
+      flex-shrink: 0;
+    }
+    .record-dot.recording {
+      background: #ef4444;
+      box-shadow: 0 0 6px 1px rgba(239,68,68,.5);
+      animation: pulse-record .9s ease-in-out infinite alternate;
+    }
+
     /* Email modal */
     .email-overlay {
       display: none;
@@ -373,6 +423,12 @@
   <div class="header">
     <h1>📝 Meet Transcriber</h1>
     <p>История записей</p>
+  </div>
+
+  <!-- Quick record strip (shown only when a supported meeting tab is active) -->
+  <div class="record-strip" id="recordStrip">
+    <div class="record-dot" id="recordDot"></div>
+    <button class="btn-record" id="recordBtn">Начать запись</button>
   </div>
 
   <div id="content"></div>

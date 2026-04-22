@@ -534,6 +534,39 @@ if (isExtensionContextAvailable()) {
   }
 }
 
+// ── Popup ↔ Content message bridge ─────────────────────────
+if (isExtensionContextAvailable()) {
+  try {
+    chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+      if (message.type === 'GET_RECORDING_STATE') {
+        sendResponse({ isRecording, initialized: storageStateInitialized });
+        return false;
+      }
+      if (message.type === 'TOGGLE_RECORDING') {
+        const newState = !isRecording;
+        isRecording = newState;
+        if (isRecording) {
+          currentSessionId = Date.now().toString();
+          transcript = [];
+          ensureCaptionObserverAttached();
+          setScopedRecordingState(true, []);
+          setPanelOpen(false);
+        } else {
+          finalizeSession();
+          transcript = [];
+          setScopedRecordingState(false, []);
+          currentSessionId = null;
+        }
+        refreshUI();
+        sendResponse({ isRecording });
+        return false;
+      }
+    });
+  } catch (e) {
+    debugDevLog('runtime.onMessage', `listener registration skipped: ${e && e.message ? e.message : 'unknown error'}`);
+  }
+}
+
 let saveTimeout;
 function saveTranscript() {
   storageStateTouchedLocally = true;
@@ -686,7 +719,8 @@ const captionObserver = new MutationObserver((mutations) => {
     const textEl = blockContainer.querySelector(captionConfig.text);
 
     if (textEl || PLATFORM === 'zoom') {
-      let speechText = textEl ? textEl.textContent.trim() : blockContainer.innerText.trim();
+      // Use textContent (not innerText) so hidden/off-screen caption elements are still read.
+      let speechText = textEl ? textEl.textContent.trim() : blockContainer.textContent.trim();
       if (!speechText) continue;
 
       if (PLATFORM === 'zoom') {
@@ -736,7 +770,13 @@ function ensureCaptionObserverAttached() {
   if (!nextRoot || observedCaptionRoot === nextRoot) return;
 
   captionObserver.disconnect();
-  captionObserver.observe(nextRoot, { childList: true, subtree: true, characterData: true });
+  captionObserver.observe(nextRoot, {
+    childList: true,
+    subtree: true,
+    characterData: true,
+    attributes: true,
+    attributeFilter: ['class', 'style', 'aria-hidden', 'data-is-muted']
+  });
   observedCaptionRoot = nextRoot;
 }
 
@@ -1052,8 +1092,8 @@ function injectWidget() {
   });
 
   toggleRecordBtn.addEventListener('click', () => {
-    if (!storageStateInitialized) return;
-
+    debugDevLog('record-button-click', `storageStateInitialized=${storageStateInitialized}, isRecording=${isRecording}`);
+    
     const newState = !isRecording;
     isRecording = newState;
     
@@ -1065,6 +1105,7 @@ function injectWidget() {
       ensureCaptionObserverAttached();
       setScopedRecordingState(true, []);
       setPanelOpen(false);
+      debugDevLog('record-start', `sessionId=${currentSessionId}`);
     } else {
       // End of session - finalize and save to history
       finalizeSession();
@@ -1072,6 +1113,7 @@ function injectWidget() {
       transcript = [];
       setScopedRecordingState(false, []);
       currentSessionId = null;
+      debugDevLog('record-stop', 'recording stopped');
     }
     
     refreshUI();

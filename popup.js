@@ -9,6 +9,74 @@ document.addEventListener('DOMContentLoaded', () => {
   const previewBody = document.getElementById('previewBody');
   const previewClose = document.getElementById('previewClose');
 
+  // Record strip elements
+  const recordStrip = document.getElementById('recordStrip');
+  const recordBtn = document.getElementById('recordBtn');
+  const recordDot = document.getElementById('recordDot');
+
+  // ── Quick-record logic ──────────────────────────────────
+  const MEETING_PATTERNS = [/meet\.google\.com/i, /teams\.microsoft\.com/i, /zoom\.us\/wc\//i];
+
+  function isMeetingUrl(url) {
+    return url ? MEETING_PATTERNS.some(p => p.test(url)) : false;
+  }
+
+  let activeMeetingTabId = null;
+
+  function updateRecordStrip(isRecording, disabled) {
+    if (activeMeetingTabId === null) {
+      recordStrip.classList.remove('visible');
+      return;
+    }
+    recordStrip.classList.add('visible');
+    recordBtn.disabled = !!disabled;
+    if (isRecording) {
+      recordBtn.textContent = '⏹ Остановить запись';
+      recordBtn.classList.add('recording');
+      recordDot.classList.add('recording');
+    } else {
+      recordBtn.textContent = '⏺ Начать запись';
+      recordBtn.classList.remove('recording');
+      recordDot.classList.remove('recording');
+    }
+  }
+
+  function queryRecordingState(tabId) {
+    chrome.tabs.sendMessage(tabId, { type: 'GET_RECORDING_STATE' }, (response) => {
+      if (chrome.runtime.lastError || !response) {
+        // Content script not injected yet or tab doesn't support it
+        activeMeetingTabId = null;
+        updateRecordStrip(false, false);
+        return;
+      }
+      activeMeetingTabId = tabId;
+      updateRecordStrip(response.isRecording, !response.initialized);
+    });
+  }
+
+  // Find active meeting tab
+  chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+    const tab = tabs && tabs[0];
+    if (tab && isMeetingUrl(tab.url)) {
+      queryRecordingState(tab.id);
+    }
+  });
+
+  recordBtn.addEventListener('click', () => {
+    if (activeMeetingTabId === null) return;
+    recordBtn.disabled = true;
+    chrome.tabs.sendMessage(activeMeetingTabId, { type: 'TOGGLE_RECORDING' }, (response) => {
+      if (chrome.runtime.lastError || !response) {
+        recordBtn.disabled = false;
+        return;
+      }
+      updateRecordStrip(response.isRecording, false);
+      // Reload session list after stopping
+      if (!response.isRecording) setTimeout(loadSessions, 600);
+    });
+  });
+  // ────────────────────────────────────────────────────────
+
   // Email modal elements
   const emailOverlay = document.getElementById('emailOverlay');
   const emailToInput = document.getElementById('emailTo');
