@@ -27,7 +27,7 @@
   },
   "content_scripts": [
     {
-      "matches": ["*://meet.google.com/*", "*://teams.microsoft.com/*", "*://teams.live.com/*", "*://zoom.us/*", "*://*.zoom.us/*"],
+      "matches": ["*://meet.google.com/*", "*://teams.microsoft.com/*", "*://teams.live.com/*", "*://teams.cloud.microsoft/*", "*://zoom.us/*", "*://*.zoom.us/*"],
       "js": ["content.js"]
     },
     {
@@ -37,7 +37,7 @@
       "world": "MAIN"
     },
     {
-      "matches": ["*://teams.microsoft.com/*", "*://teams.live.com/*"],
+      "matches": ["*://teams.microsoft.com/*", "*://teams.live.com/*", "*://teams.cloud.microsoft/*"],
       "js": ["teams-capture.js"],
       "run_at": "document_start",
       "world": "MAIN"

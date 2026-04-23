@@ -73,7 +73,7 @@ const CAPTION_SELECTORS = {
 function detectPlatform() {
   const host = window.location.hostname;
   if (host.includes('meet.google.com')) return 'meet';
-  if (host.includes('teams.microsoft.com') || host.includes('teams.live.com')) return 'teams';
+  if (host.includes('teams.microsoft.com') || host.includes('teams.live.com') || host.includes('teams.cloud.microsoft')) return 'teams';
   if (host.includes('zoom.us')) return 'zoom';
   return 'unknown';
 }

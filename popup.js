@@ -37,7 +37,7 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   // ── Quick-record logic ──────────────────────────────────
-  const MEETING_PATTERNS = [/meet\.google\.com/i, /teams\.microsoft\.com/i, /teams\.live\.com/i, /zoom\.us\/wc\//i];
+  const MEETING_PATTERNS = [/meet\.google\.com/i, /teams\.microsoft\.com/i, /teams\.live\.com/i, /teams\.cloud\.microsoft/i, /zoom\.us\/wc\//i];
 
   function isMeetingUrl(url) {
     return url ? MEETING_PATTERNS.some(p => p.test(url)) : false;
@@ -202,7 +202,7 @@ document.addEventListener('DOMContentLoaded', () => {
           <div class="icon">📭</div>
           <div>Пока нет записанных сессий</div>
           <div style="margin-top:6px; font-size:11px; color:#475569;">
-            Откройте Google Meet, включите субтитры и начните запись
+            Откройте Google Meet или Teams, включите субтитры и начните запись
           </div>
         </div>
       `;
