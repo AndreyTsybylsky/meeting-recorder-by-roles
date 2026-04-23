@@ -756,9 +756,18 @@ setInterval(() => {
       endedScreen = document.querySelector('[data-testid*="meeting-ended" i], [class*="meeting-ended" i], [class*="ended" i], [aria-label*="Meeting ended" i]');
       meetingContainer = document.querySelector('[class*="meeting-client" i], [class*="meeting-app" i], [class*="in-meeting" i], [class*="video-layout" i], [data-testid*="meeting" i], [data-testid*="video" i]');
     } else {
-      leaveBtn = document.querySelector('[aria-label*="Leave"], [aria-label*="встречу"], [aria-label*="Покинуть"]');
-      endedScreen = document.querySelector('[data-termination-message], .V006ub, .J57M8c');
-      meetingContainer = document.querySelector('.view-container, .wrapper, .a4cQT');
+      // Google Meet: use specific selectors to avoid false-positives
+      // Leave button is always visible during active call
+      leaveBtn = document.querySelector(
+        'button[aria-label*="Leave call" i], button[aria-label*="Leave meeting" i], ' +
+        'button[aria-label*="встречу" i], button[aria-label*="Покинуть" i], ' +
+        '[data-tooltip*="Leave" i], [data-idom-class*="leave" i]'
+      );
+      // Only [data-termination-message] is specific to Meet's "call ended" screen;
+      // .V006ub / .J57M8c are too broad and match caption-close toast notifications.
+      endedScreen = document.querySelector('[data-termination-message]');
+      // .a4cQT is Google Meet's persistent call container; avoid generic .wrapper/.view-container
+      meetingContainer = document.querySelector('.a4cQT, [data-call-ended="false"], [jsname="F80f8"], [data-meeting-code]');
     }
     
     // Track when we first see the meeting container so we don't false-fire on load
