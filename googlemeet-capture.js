@@ -142,7 +142,7 @@
       var text          = msg[6] && msg[6][0] ? str(msg[6][0].v) : '';
       var langId        = msg[8] && msg[8][0] ? msg[8][0].v : 0;
       // Require all semantic fields to be present and non-zero
-      if (!deviceId || !messageId || !messageVer || !langId || !text) return null;
+      if (!deviceId || !messageId || !messageVer || !text) return null;
       return {
         deviceId:       '@' + deviceId,
         messageId:      messageId + '/@' + deviceId,
@@ -200,17 +200,27 @@
     document.dispatchEvent(new CustomEvent('__mt_meet_device', { detail: info }));
   }
 
-  // ── RTCPeerConnection intercept ──────────────────────────────
-  var RTC = window.RTCPeerConnection;
-  if (!RTC) return;
+  // ── RTCPeerConnection intercept (Tactiq pattern) ─────────────
+  // KEY INSIGHT (from Tactiq source):
+  //   Meet's 'captions' DataChannel is CLIENT-created, not server-created.
+  //   The extension must call pc.createDataChannel('captions') itself once
+  //   the peer connection is established (signalled by the server-created
+  //   'collections' channel arriving via ondatachannel).
+  //   'collections' IS server-created (arrives via ondatachannel).
+  //
+  // Approach: replace window.RTCPeerConnection with a wrapper constructor
+  // (exactly like Tactiq), attach ondatachannel listener to every instance,
+  // and when 'collections' arrives create 'captions' ourselves.
+  var OrigRTC = window.RTCPeerConnection;
+  if (!OrigRTC) return;
 
-  var origCreate = RTC.prototype.createDataChannel;
-  RTC.prototype.createDataChannel = function (label, opts) {
-    var channel = origCreate.apply(this, arguments);
-    if (!channel) return channel;
+  var origCreateDC = OrigRTC.prototype.createDataChannel;
 
-    if (label === 'captions') {
-      channel.addEventListener('message', function (evt) {
+  function attachCaptionsChannel(pc) {
+    try {
+      var ch = origCreateDC.call(pc, 'captions', { ordered: true, maxRetransmits: 10 });
+      // Listen for caption messages on this channel
+      ch.addEventListener('message', function (evt) {
         var u8 = toU8(evt.data);
         if (!u8 || typeof evt.data === 'string') return;
         decompress(u8).then(function (data) {
@@ -220,21 +230,53 @@
           }
         });
       });
-    }
+    } catch (e) { /* pc may already be closed */ }
+  }
 
-    if (label === 'collections') {
-      channel.addEventListener('message', function (evt) {
-        var u8 = toU8(evt.data);
-        if (!u8 || typeof evt.data === 'string') return;
-        decompress(u8).then(function (data) {
-          var info = decodeDeviceFrame(data);
-          if (info) dispatchDevice(info);
+  // Wrapper constructor — replaces window.RTCPeerConnection
+  function WrapRTC(config, constraints) {
+    var pc = new OrigRTC(config, constraints);
+
+    // Server-created channels arrive here
+    pc.addEventListener('datachannel', function (evt) {
+      var ch = evt.channel;
+
+      if (ch.label === 'collections') {
+        // 'collections' channel carries participant deviceId → name maps
+        ch.addEventListener('message', function (evt2) {
+          var u8 = toU8(evt2.data);
+          if (!u8 || typeof evt2.data === 'string') return;
+          decompress(u8).then(function (data) {
+            var info = decodeDeviceFrame(data);
+            if (info) dispatchDevice(info);
+          });
         });
-      });
-    }
+        // SCTP transport is up — create the captions channel now
+        attachCaptionsChannel(pc);
+      }
 
-    return channel;
-  };
+      // Also handle 'meet_messages' (alternative caption channel on some versions)
+      if (ch.label === 'meet_messages') {
+        ch.addEventListener('message', function (evt2) {
+          var u8 = toU8(evt2.data);
+          if (!u8 || typeof evt2.data === 'string') return;
+          decompress(u8).then(function (data) {
+            var msg = decodeCaptionFrame(data);
+            if (msg) {
+              document.dispatchEvent(new CustomEvent('__mt_meet_caption', { detail: msg }));
+            }
+          });
+        });
+      }
+    });
+
+    // Return pc — constructor returning an object overrides 'this'
+    return pc;
+  }
+
+  // Keep prototype chain intact so instanceof checks still work
+  WrapRTC.prototype = OrigRTC.prototype;
+  window.RTCPeerConnection = WrapRTC;
 
   // ── Fetch intercept for initial participant list ──────────────
   var origFetch = window.fetch;
