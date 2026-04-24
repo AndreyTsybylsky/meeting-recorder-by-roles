@@ -47,6 +47,7 @@
   });
 
   var SYNC_URL = 'https://meet.google.com/$rpc/google.rtc.meetings.v1.MeetingSpaceService/SyncMeetingSpaceCollections';
+  var CREATE_MESSAGE_URL = 'https://meet.google.com/$rpc/google.rtc.meetings.v1.MeetingMessageService/CreateMeetingMessage';
 
   // ── Minimal length-safe protobuf parser ──────────────────────
   // Returns { v: value, p: nextPosition }
@@ -154,6 +155,164 @@
     return null;
   }
 
+  function indexOfBytes(haystack, needle, from, wildcardAt) {
+    var start = from || 0;
+    var wildcard = (wildcardAt === undefined) ? -1 : wildcardAt;
+    if (!haystack || !needle || !needle.length) return -1;
+    for (var i = start; i <= haystack.length - needle.length; i++) {
+      var ok = true;
+      for (var j = 0; j < needle.length; j++) {
+        if (j !== wildcard && haystack[i + j] !== needle[j]) {
+          ok = false;
+          break;
+        }
+      }
+      if (ok) return i;
+    }
+    return -1;
+  }
+
+  function decodeCaptionFrameFallback(u8) {
+    try {
+      // This branch is intentionally heuristic. Meet occasionally changes
+      // the envelope and strict protobuf parsing starts returning null.
+      // We recover by looking for stable byte boundaries around message
+      // id/version/text used by recent Meet builds.
+      var iMsgIdTag = u8.indexOf(16);
+      if (iMsgIdTag < 0) return null;
+
+      var boundaryCandidates = [
+        indexOfBytes(u8, [24, 0, 32, 1, 45, 0], iMsgIdTag + 1, 1),
+        indexOfBytes(u8, [24, 0, 1, 32, 1, 45, 0], iMsgIdTag + 1, 1),
+        indexOfBytes(u8, [24, 0, 45, 0], iMsgIdTag + 1, 1),
+        indexOfBytes(u8, [24, 0, 1, 45, 0], iMsgIdTag + 1, 1)
+      ];
+
+      var boundary = -1;
+      for (var k = 0; k < boundaryCandidates.length; k++) {
+        if (boundaryCandidates[k] > -1) {
+          boundary = boundaryCandidates[k];
+          break;
+        }
+      }
+
+      var textPrefixCandidates = [
+        indexOfBytes(u8, [24, 0, 32, 1, 50], iMsgIdTag + 1, 1),
+        indexOfBytes(u8, [24, 0, 1, 32, 1, 50], iMsgIdTag + 1, 1),
+        indexOfBytes(u8, [24, 0, 50], iMsgIdTag + 1, 1),
+        indexOfBytes(u8, [24, 0, 1, 50], iMsgIdTag + 1, 1)
+      ];
+
+      var textPrefix = -1;
+      for (var m = 0; m < textPrefixCandidates.length; m++) {
+        if (textPrefixCandidates[m] > -1) {
+          textPrefix = textPrefixCandidates[m];
+          break;
+        }
+      }
+
+      if (boundary < 0 && textPrefix < 0) return null;
+      var boundaryPos = boundary > -1 ? boundary : textPrefix;
+
+      var msgIdBytes = u8.slice(iMsgIdTag + 1, boundaryPos);
+      if (!msgIdBytes.length) return null;
+      var msgId = 0;
+      for (var n = 0; n < msgIdBytes.length; n++) {
+        msgId += msgIdBytes[n] * Math.pow(256, n);
+      }
+
+      var iLangPrefixA = indexOfBytes(u8, [64, 0, 72], 0, 1);
+      var iLangPrefixB = indexOfBytes(u8, [64, 0, 80], 0, 1);
+      var iLang = iLangPrefixA > -1 ? iLangPrefixA : iLangPrefixB;
+      if (iLang < 0) return null;
+
+      var textStart = textPrefix > -1 ? (textPrefix + 5) : (indexOfBytes(u8, [128, 63], 0, -1) + 4);
+      if (textStart < 0 || textStart >= iLang) return null;
+
+      var rawDevice = '';
+      var iDeviceStop = u8.indexOf(16, 4);
+      if (iDeviceStop > 4) {
+        rawDevice = str(u8.slice(3, iDeviceStop)).trim();
+      }
+      if (!rawDevice) return null;
+
+      var text = str(u8.slice(textStart, iLang)).trim();
+      if (!text) return null;
+
+      var messageVersion = (boundaryPos >= 0 && (boundaryPos + 1) < u8.length) ? u8[boundaryPos + 1] : 1;
+
+      return {
+        deviceId: '@' + rawDevice,
+        messageId: msgId + '/@' + rawDevice,
+        messageVersion: messageVersion || 1,
+        text: text
+      };
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function toAsciiCodes(s) {
+    var out = [];
+    for (var i = 0; i < s.length; i++) out.push(s.charCodeAt(i));
+    return out;
+  }
+
+  // Parse speech payload from Meet "message" stream (Tactiq-style fallback).
+  // This is separate from BTranscriptMessage captions and helps when Meet ships
+  // a changed frame layout that breaks strict caption decoding.
+  function decodeSpeechFromMessageStream(u8) {
+    try {
+      var msgMarker = toAsciiCodes('/messages/');
+      var devMarker = toAsciiCodes('spaces/');
+
+      var iMsg = indexOfBytes(u8, msgMarker, 0, -1);
+      if (iMsg < 0) return null;
+
+      var iMsgStop = indexOfBytes(u8, [18], iMsg, -1);
+      if (iMsgStop < 0) return null;
+      var messageIdBase = str(u8.slice(iMsg + msgMarker.length, iMsgStop));
+      if (!messageIdBase) return null;
+
+      var iDev = indexOfBytes(u8, devMarker, iMsgStop, -1);
+      var iDevStop = iDev >= 0 ? indexOfBytes(u8, [24], iDev, -1) : -1;
+      if (iDev < 0 || iDevStop < 0) return null;
+      var deviceIdRaw = str(u8.slice(iDev, iDevStop));
+      if (!deviceIdRaw) return null;
+
+      var iTextLenStart = indexOfBytes(u8, [10], iDev, -1) + 1;
+      if (iTextLenStart <= 0) return null;
+      if (u8[iTextLenStart - 1] === 10 && u8[iTextLenStart + 1] === 8) iTextLenStart++;
+
+      var iVarEnd = (u8[iTextLenStart + 1] < 4) ? (iTextLenStart + 2) : (iTextLenStart + 1);
+      var lenBytes = u8.slice(iTextLenStart, iVarEnd);
+      if (!lenBytes.length) return null;
+
+      var textLen = 0;
+      for (var iLen = 0; iLen < lenBytes.length; iLen++) {
+        // Keep parity with Tactiq varint fallback logic.
+        textLen += Math.pow(128, iLen) * (iLen ? (lenBytes[iLen] - 1) : lenBytes[iLen]);
+      }
+      if (textLen <= 0) return null;
+
+      var iTextStart = iVarEnd;
+      var iTextEnd = iTextStart + textLen;
+      if (iTextEnd > u8.length) return null;
+
+      var text = str(u8.slice(iTextStart, iTextEnd)).trim();
+      if (!text) return null;
+
+      return {
+        deviceId: '@' + deviceIdRaw,
+        messageId: messageIdBase + '/@' + deviceIdRaw,
+        messageVersion: 1,
+        text: text
+      };
+    } catch (e) {
+      return null;
+    }
+  }
+
   // ── BTranscriptMessageWrapper decoder ────────────────────────
   // Protobuf schema (as reverse-engineered by Tactiq):
   //   BTranscriptMessageWrapper { field1: BTranscriptMessage, field2: string (unknown2) }
@@ -176,8 +335,19 @@
       var messageVer    = msg[3] && msg[3][0] ? msg[3][0].v : 0;
       var text          = msg[6] && msg[6][0] ? str(msg[6][0].v) : '';
       var langId        = msg[8] && msg[8][0] ? msg[8][0].v : 0;
-      // Require all semantic fields to be present and non-zero
+      // Require all semantic fields to be present and non-zero.
+      // If strict protobuf parse fails, fall back to heuristic decoding.
       if (!deviceId || !messageId || !messageVer || !text) {
+        var fallbackMsg = decodeCaptionFrameFallback(u8);
+        if (fallbackMsg) {
+          log('caption-decode:fallback-ok', {
+            deviceId: fallbackMsg.deviceId,
+            messageId: fallbackMsg.messageId,
+            messageVersion: fallbackMsg.messageVersion,
+            textLength: fallbackMsg.text.length
+          });
+          return fallbackMsg;
+        }
         warn('caption-decode-skip:missing-required', {
           hasDeviceId: !!deviceId,
           messageId: messageId,
@@ -194,6 +364,16 @@
         text:           text
       };
     } catch (e) {
+      var fallbackFromError = decodeCaptionFrameFallback(u8);
+      if (fallbackFromError) {
+        log('caption-decode:fallback-after-error', {
+          deviceId: fallbackFromError.deviceId,
+          messageId: fallbackFromError.messageId,
+          messageVersion: fallbackFromError.messageVersion,
+          textLength: fallbackFromError.text.length
+        });
+        return fallbackFromError;
+      }
       warn('caption-decode-error', e && e.message ? e.message : e);
       return null;
     }
@@ -278,11 +458,35 @@
   }
 
   var origCreateDC = OrigRTC.prototype.createDataChannel;
+  var activePeerConnection = null;
+  var activeCaptionsChannel = null;
+  var captionsMonitorStarted = false;
+
+  function startCaptionsMonitor() {
+    if (captionsMonitorStarted) return;
+    captionsMonitorStarted = true;
+
+    setInterval(function () {
+      if (!activePeerConnection) return;
+      if (activePeerConnection.connectionState === 'closed' || activePeerConnection.connectionState === 'failed') return;
+
+      var channelMissing = !activeCaptionsChannel;
+      var state = channelMissing ? 'missing' : activeCaptionsChannel.readyState;
+      if (state === 'open' || state === 'connecting') return;
+
+      warn('captions-monitor:channel-unhealthy', {
+        channelState: state,
+        pcState: activePeerConnection.connectionState
+      });
+      attachCaptionsChannel(activePeerConnection);
+    }, 5000);
+  }
 
   function attachCaptionsChannel(pc) {
     try {
       log('captions-create:start');
       var ch = origCreateDC.call(pc, 'captions', { ordered: true, maxRetransmits: 10 });
+      activeCaptionsChannel = ch;
       log('captions-create:ok', { readyState: ch.readyState });
 
       ch.addEventListener('open', function () {
@@ -291,6 +495,7 @@
 
       ch.addEventListener('close', function () {
         warn('captions-channel-close', { readyState: ch.readyState });
+        if (activeCaptionsChannel === ch) activeCaptionsChannel = null;
       });
 
       ch.addEventListener('error', function (evt) {
@@ -332,6 +537,8 @@
   function WrapRTC(config, constraints) {
     log('rtc-wrap:new-connection');
     var pc = new OrigRTC(config, constraints);
+    activePeerConnection = pc;
+    startCaptionsMonitor();
 
     // Server-created channels arrive here
     pc.addEventListener('datachannel', function (evt) {
@@ -383,6 +590,7 @@
           }
           decompress(u8).then(function (data) {
             var msg = decodeCaptionFrame(data);
+            if (!msg) msg = decodeSpeechFromMessageStream(data);
             if (msg) {
               log('meet_messages:decoded', {
                 deviceId: msg.deviceId,
@@ -442,6 +650,35 @@
         warn('fetch-sync-collections:request-failed', e && e.message ? e.message : e);
       });
     }
+
+    if (urlStr === CREATE_MESSAGE_URL) {
+      log('fetch-create-meeting-message:hit');
+      p.then(function (resp) {
+        resp.clone().text().then(function (b64) {
+          try {
+            var u8 = Uint8Array.from(atob(b64), function (c) { return c.charCodeAt(0); });
+            var msg = decodeSpeechFromMessageStream(u8);
+            if (!msg) msg = decodeCaptionFrame(u8);
+            if (msg) {
+              log('fetch-create-meeting-message:decoded', {
+                deviceId: msg.deviceId,
+                messageId: msg.messageId,
+                version: msg.messageVersion,
+                textLength: msg.text.length
+              });
+              document.dispatchEvent(new CustomEvent('__mt_meet_caption', { detail: msg }));
+            } else {
+              warn('fetch-create-meeting-message:decode-null', { bytes: u8.length });
+            }
+          } catch (e) {
+            warn('fetch-create-meeting-message:parse-failed', e && e.message ? e.message : e);
+          }
+        }).catch(function () {});
+      }).catch(function (e) {
+        warn('fetch-create-meeting-message:request-failed', e && e.message ? e.message : e);
+      });
+    }
+
     return p;
   };
 
