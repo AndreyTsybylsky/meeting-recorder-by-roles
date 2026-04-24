@@ -1510,6 +1510,14 @@ if (PLATFORM === 'meet') {
         meetCaptionEnabledByBootstrap = false;
         meetCaptionManualVisible = false;
         mtLog('caption-keeper:manual-visible-off');
+      } else {
+        // aria-pressed/label ambiguous — use DOM presence as tiebreaker.
+        const captionDomOpen = !!document.querySelector(
+          'div[jsname="W297wb"], .iY996, .V006ub, .nMcdL, [jsname="YSZ4cc"], [jsname="Vpvi7b"]'
+        );
+        meetCaptionEnabledByBootstrap = false;
+        meetCaptionManualVisible = captionDomOpen;
+        mtLog('caption-keeper:manual-visible-dom-fallback', { captionDomOpen });
       }
     }, 120);
   }, true);
@@ -1547,6 +1555,19 @@ if (PLATFORM === 'meet') {
     } else if (captionsEnabled === true && !meetCaptionEnabledByBootstrap && !meetCaptionManualVisible) {
       meetCaptionManualVisible = true;
       mtLog('caption-keeper:auto-detected-manual-visible-on');
+    } else if (captionsEnabled === null) {
+      // Button state is ambiguous (aria-pressed absent, aria-label in unrecognized locale, etc.).
+      // Fall back to DOM presence: Meet only renders caption overlay nodes when captions are ON.
+      const captionDomOpen = !!document.querySelector(
+        'div[jsname="W297wb"], .iY996, .V006ub, .nMcdL, [jsname="YSZ4cc"], [jsname="Vpvi7b"]'
+      );
+      if (captionDomOpen && !meetCaptionManualVisible && !meetCaptionEnabledByBootstrap) {
+        meetCaptionManualVisible = true;
+        mtLog('caption-keeper:dom-fallback-captions-open');
+      } else if (!captionDomOpen && meetCaptionManualVisible) {
+        meetCaptionManualVisible = false;
+        mtLog('caption-keeper:dom-fallback-captions-closed');
+      }
     }
 
     // Tactiq-like behavior: visual visibility is user-configurable and
