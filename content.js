@@ -838,6 +838,7 @@ function stopAndSave(reason) {
   isRecording = false;
   setScopedRecordingState(false, []);
   currentSessionId = null;
+  if (PLATFORM === 'meet') removeMeetCaptionHideStyle();
   mtWarn('stopAndSave:recording-stopped', { reason: reason || 'unspecified' });
   refreshUI();
 }
@@ -1160,17 +1161,60 @@ if (PLATFORM === 'meet') {
   });
 }
 
-// ── Google Meet: Caption Keeper ──────────────────────────────
-// Google Meet stops sending caption data (both DOM mutations AND the
-// WebRTC captions data-channel) as soon as the built-in caption UI
-// panel is closed. This watcher re-enables the native caption panel
-// automatically while recording is active, so the transcript never
-// silently stops capturing mid-meeting.
+// ── Google Meet: Caption Keeper + Visual Hide ────────────────
+//
+// WHY THIS APPROACH:
+//   Google Meet's server only sends caption payload (both DOM content
+//   and WebRTC DataChannel frames) when captions are "on" in the UI.
+//   This is a server-side gate — we cannot bypass it by connecting to
+//   the transport layer alone (Tactiq uses the same technique).
+//
+//   Solution: keep native captions always enabled via the toolbar button,
+//   but immediately hide the rendered caption overlay with injected CSS
+//   (opacity:0 + pointer-events:none). The elements remain in the DOM so
+//   our MutationObserver keeps reading them; the user sees nothing extra.
+//
+const MEET_CAPTION_HIDE_STYLE_ID = '__mt-caption-hide';
+
+function injectMeetCaptionHideStyle() {
+  if (document.getElementById(MEET_CAPTION_HIDE_STYLE_ID)) return;
+  const style = document.createElement('style');
+  style.id = MEET_CAPTION_HIDE_STYLE_ID;
+  // Target both the individual segments and any known outer wrappers.
+  // opacity:0 keeps the elements in the layout tree (MutationObserver
+  // still fires), display/visibility changes can sometimes affect Meet's
+  // internal state so we deliberately avoid them.
+  style.textContent = `
+    div[jsname="W297wb"],
+    .iY996, .V006ub, .nS7Zeb,
+    .nMcdL, [jsname="YSZ4cc"], [jsname="Vpvi7b"],
+    [jsname="dsyhDe"], .a4cQT > [jsname] > [class*="caption" i] {
+      opacity: 0 !important;
+      pointer-events: none !important;
+    }
+  `;
+  document.head.appendChild(style);
+  mtLog('caption-keeper:hide-style-injected');
+}
+
+function removeMeetCaptionHideStyle() {
+  const style = document.getElementById(MEET_CAPTION_HIDE_STYLE_ID);
+  if (style) {
+    style.remove();
+    mtLog('caption-keeper:hide-style-removed');
+  }
+}
+
 if (PLATFORM === 'meet') {
   let captionKeeperWarned = false;
 
   setInterval(() => {
-    if (!isRecording) return;
+    if (!isRecording) {
+      // Remove the hide overlay when not recording so the user can still
+      // use native captions independently.
+      removeMeetCaptionHideStyle();
+      return;
+    }
 
     // Only act while we're confirmed to be inside an active call.
     const inMeeting = !!document.querySelector(
@@ -1180,15 +1224,22 @@ if (PLATFORM === 'meet') {
     );
     if (!inMeeting) return;
 
-    // If any caption panel element exists, captions are already on.
+    // If caption panel elements are present, captions are already on.
     const captionConfig = getCaptionConfig();
     const captionsPresent = !!document.querySelector(captionConfig.container);
+
     if (captionsPresent) {
-      captionKeeperWarned = false; // reset so next closure is logged
+      captionKeeperWarned = false;
+      // Captions are on — inject the visual hide so the user doesn't see
+      // the native overlay. Idempotent: no-op if style already injected.
+      injectMeetCaptionHideStyle();
       return;
     }
 
-    // Caption panel is absent — try to click the "Turn on captions" button.
+    // Caption panel is absent — remove stale hide style first (in case it
+    // was injected in a previous cycle), then click "Turn on captions".
+    removeMeetCaptionHideStyle();
+
     const ccBtn = document.querySelector(
       'button[aria-label*="Turn on captions" i], ' +
       'button[aria-label*="Enable captions" i], ' +
