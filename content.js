@@ -1397,7 +1397,9 @@ function clearMeetCaptionBootstrapTimer() {
 function tryEnableMeetCaptionsOnRecordingStart(trigger) {
   if (PLATFORM !== 'meet') return;
   if (!isRecording) return;
-  if (!meetTryEnableCaptionsOnStart) return;
+  // Always bootstrap when overlay-hidden mode is on (capture depends on captions being enabled).
+  // Also bootstrap if the user explicitly requested it via the toggle.
+  if (!meetTryEnableCaptionsOnStart && !meetCaptionOverlayHidden) return;
   if (meetCaptionBootstrapAttemptedForSession) return;
 
   meetCaptionBootstrapAttemptedForSession = true;
@@ -1484,7 +1486,6 @@ if (PLATFORM === 'meet') {
 
   document.addEventListener('click', (evt) => {
     if (!isRecording) return;
-    if (!meetCaptionOverlayHidden) return;
 
     const target = evt.target;
     if (!(target instanceof Element)) return;
@@ -1499,7 +1500,43 @@ if (PLATFORM === 'meet') {
     if (!ccBtn) return;
     if (suppressNextMeetCaptionToggleClick) return;
 
-    // Evaluate final state after Meet handles the click.
+    const currentlyEnabled = isMeetCaptionsEnabled(ccBtn);
+
+    if (meetCaptionOverlayHidden) {
+      // Captions overlay is in "hidden" mode — recording depends on Meet keeping
+      // captions ON at the server level. Block the click so Meet does NOT turn
+      // captions off (which would stop the DataChannel stream).
+      // Instead toggle only the CSS visual overlay.
+      evt.preventDefault();
+      evt.stopImmediatePropagation();
+
+      if (currentlyEnabled === false) {
+        // Captions were off — this would have turned them ON.
+        // Let bootstrap handle it instead of passing the click through.
+        suppressNextMeetCaptionToggleClick = true;
+        meetCaptionEnabledByBootstrap = true;
+        ccBtn.click();
+        setTimeout(() => { suppressNextMeetCaptionToggleClick = false; }, 800);
+        meetCaptionManualVisible = false; // keep visual hidden
+        mtLog('caption-keeper:intercept-enable-kept-hidden');
+      } else {
+        // Captions were on — user tried to close them. Block it, just toggle visual.
+        meetCaptionEnabledByBootstrap = false;
+        meetCaptionManualVisible = !meetCaptionManualVisible;
+        mtLog('caption-keeper:intercept-close-blocked-toggle-visual', { nowVisible: meetCaptionManualVisible });
+      }
+
+      // Immediately apply the CSS change without waiting for the interval.
+      if (meetCaptionOverlayHidden && !meetCaptionManualVisible) {
+        injectMeetCaptionHideStyle();
+      } else {
+        removeMeetCaptionHideStyle();
+      }
+      return;
+    }
+
+    // meetCaptionOverlayHidden is false — user sees native captions, allow the
+    // click through and just track the resulting state.
     setTimeout(() => {
       const enabled = isMeetCaptionsEnabled(ccBtn);
       if (enabled === true) {
