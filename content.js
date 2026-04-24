@@ -185,6 +185,12 @@ let storageStateInitialized = false;
 let storageStateTouchedLocally = false;
 let sidebarEnabled = false;    // off by default for stealth; user enables via popup
 let autoRecordEnabled = true;  // record automatically on join; user can disable via popup
+let meetCaptionOverlayHidden = true; // Tactiq-like default: capture continues while native overlay is hidden
+let meetTryEnableCaptionsOnStart = false; // Optional bootstrap: try enabling captions once on recording start
+let meetCaptionBootstrapAttemptedForSession = false;
+let meetCaptionBootstrapTimer = null;
+let meetCaptionManualVisible = false;
+let suppressNextMeetCaptionToggleClick = false;
 // Guard: only trigger "meeting ended" detection after the meeting container has been
 // seen at least once. Prevents false-positive stopAndSave() on initial page load
 // before the meeting UI finishes rendering (Teams SPA issue).
@@ -592,7 +598,7 @@ function setScopedRecordingState(nextIsRecording, nextTranscript) {
 }
 
 // ── Persistence ─────────────────────────────────────────────
-safeStorageGet([RECORDING_STORAGE_KEY, TRANSCRIPT_STORAGE_KEY, 'isRecording', 'transcript', 'sidebarEnabled', 'autoRecordEnabled'], (res) => {
+safeStorageGet([RECORDING_STORAGE_KEY, TRANSCRIPT_STORAGE_KEY, 'isRecording', 'transcript', 'sidebarEnabled', 'autoRecordEnabled', 'meetCaptionOverlayHidden', 'meetTryEnableCaptionsOnStart'], (res) => {
   const scopedIsRecording = res[RECORDING_STORAGE_KEY];
   const scopedTranscript = res[TRANSCRIPT_STORAGE_KEY];
 
@@ -602,7 +608,9 @@ safeStorageGet([RECORDING_STORAGE_KEY, TRANSCRIPT_STORAGE_KEY, 'isRecording', 't
     legacyIsRecording: res.isRecording,
     legacyTranscriptLength: Array.isArray(res.transcript) ? res.transcript.length : -1,
     sidebarEnabled: res.sidebarEnabled,
-    autoRecordEnabled: res.autoRecordEnabled
+    autoRecordEnabled: res.autoRecordEnabled,
+    meetCaptionOverlayHidden: res.meetCaptionOverlayHidden,
+    meetTryEnableCaptionsOnStart: res.meetTryEnableCaptionsOnStart
   });
 
   // Resolve autoRecordEnabled setting (default true if never set)
@@ -611,6 +619,12 @@ safeStorageGet([RECORDING_STORAGE_KEY, TRANSCRIPT_STORAGE_KEY, 'isRecording', 't
   if (res.sidebarEnabled !== undefined) {
     sidebarEnabled = !!res.sidebarEnabled;
   }
+  meetCaptionOverlayHidden = res.meetCaptionOverlayHidden !== undefined
+    ? !!res.meetCaptionOverlayHidden
+    : true;
+  meetTryEnableCaptionsOnStart = res.meetTryEnableCaptionsOnStart !== undefined
+    ? !!res.meetTryEnableCaptionsOnStart
+    : false;
 
   // If the user already toggled recording locally, don't overwrite state with stale async read.
   if (!storageStateTouchedLocally) {
@@ -628,9 +642,11 @@ safeStorageGet([RECORDING_STORAGE_KEY, TRANSCRIPT_STORAGE_KEY, 'isRecording', 't
       isRecording = true;
       currentSessionId = Date.now().toString();
       transcript = [];
+      meetCaptionBootstrapAttemptedForSession = false;
       ensureCaptionObserverAttached();
       setScopedRecordingState(true, []);
       mtLog('storage-init:auto-start-enabled', { sessionId: currentSessionId });
+      tryEnableMeetCaptionsOnRecordingStart('auto-start');
     }
 
     // Restore transcript only if we are resuming (not fresh auto-start).
@@ -651,7 +667,9 @@ safeStorageGet([RECORDING_STORAGE_KEY, TRANSCRIPT_STORAGE_KEY, 'isRecording', 't
     isRecording: isRecording,
     transcriptLength: transcript.length,
     sidebarEnabled: sidebarEnabled,
-    autoRecordEnabled: autoRecordEnabled
+    autoRecordEnabled: autoRecordEnabled,
+    meetCaptionOverlayHidden: meetCaptionOverlayHidden,
+    meetTryEnableCaptionsOnStart: meetTryEnableCaptionsOnStart
   });
   refreshUI();
 });
@@ -677,6 +695,14 @@ if (isExtensionContextAvailable()) {
           autoRecordEnabled = !!changes['autoRecordEnabled'].newValue;
           mtLog('storage.onChanged:autoRecordEnabled', { autoRecordEnabled: autoRecordEnabled });
         }
+        if (changes['meetCaptionOverlayHidden'] !== undefined) {
+          meetCaptionOverlayHidden = !!changes['meetCaptionOverlayHidden'].newValue;
+          mtLog('storage.onChanged:meetCaptionOverlayHidden', { meetCaptionOverlayHidden: meetCaptionOverlayHidden });
+        }
+        if (changes['meetTryEnableCaptionsOnStart'] !== undefined) {
+          meetTryEnableCaptionsOnStart = !!changes['meetTryEnableCaptionsOnStart'].newValue;
+          mtLog('storage.onChanged:meetTryEnableCaptionsOnStart', { meetTryEnableCaptionsOnStart: meetTryEnableCaptionsOnStart });
+        }
         refreshUI();
       }
     });
@@ -700,9 +726,12 @@ if (isExtensionContextAvailable()) {
         if (isRecording) {
           currentSessionId = Date.now().toString();
           transcript = [];
+          meetCaptionManualVisible = false;
+          meetCaptionBootstrapAttemptedForSession = false;
           ensureCaptionObserverAttached();
           setScopedRecordingState(true, []);
           mtLog('recording-start:manual-toggle', { sessionId: currentSessionId });
+          tryEnableMeetCaptionsOnRecordingStart('manual-toggle');
           // Close the transcript panel if the widget is already injected
           if (typeof window.__meetTranscriberSetPanelOpen === 'function') {
             window.__meetTranscriberSetPanelOpen(false);
@@ -711,6 +740,9 @@ if (isExtensionContextAvailable()) {
           mtWarn('recording-stop:manual-toggle', { transcriptLength: transcript.length });
           finalizeSession();
           transcript = [];
+          meetCaptionManualVisible = false;
+          clearMeetCaptionBootstrapTimer();
+          meetCaptionBootstrapAttemptedForSession = false;
           setScopedRecordingState(false, []);
           currentSessionId = null;
         }
@@ -1128,6 +1160,83 @@ if (PLATFORM === 'zoom') {
 // It also fills meetDeviceMap via __mt_meet_device events from the
 // 'collections' channel and the SyncMeetingSpaceCollections HTTP call.
 const meetDeviceMap = {}; // '@deviceId' → displayName
+let lastMeetCaptionActivityAt = Date.now();
+const meetSourceStats = {
+  window: [],
+  totals: {
+    captions: 0,
+    meet_messages: 0,
+    create_meeting_message: 0,
+    unknown: 0
+  },
+  lastSource: null,
+  lastSwitchAt: 0,
+  lastMetricsLogAt: 0
+};
+
+function normalizeMeetSource(source) {
+  if (source === 'captions') return 'captions';
+  if (source === 'meet_messages') return 'meet_messages';
+  if (source === 'create_meeting_message') return 'create_meeting_message';
+  return 'unknown';
+}
+
+function getMeetSourceStatsSnapshot() {
+  const now = Date.now();
+  const minAt = now - 60000;
+  meetSourceStats.window = meetSourceStats.window.filter(item => item.at >= minAt);
+
+  const epm = {
+    captions: 0,
+    meet_messages: 0,
+    create_meeting_message: 0,
+    unknown: 0
+  };
+
+  meetSourceStats.window.forEach(item => {
+    if (!epm[item.source] && item.source !== 'unknown') return;
+    epm[item.source] += 1;
+  });
+
+  return {
+    epm: epm,
+    totals: { ...meetSourceStats.totals },
+    lastSource: meetSourceStats.lastSource,
+    lastSwitchAgoMs: meetSourceStats.lastSwitchAt ? (now - meetSourceStats.lastSwitchAt) : null
+  };
+}
+
+function trackMeetSourceActivity(sourceRaw) {
+  const now = Date.now();
+  const source = normalizeMeetSource(sourceRaw);
+  const prev = meetSourceStats.lastSource;
+
+  meetSourceStats.window.push({ at: now, source: source });
+  if (meetSourceStats.totals[source] === undefined) meetSourceStats.totals[source] = 0;
+  meetSourceStats.totals[source] += 1;
+
+  if (prev && prev !== source) {
+    meetSourceStats.lastSwitchAt = now;
+    mtWarn('meet-source:switch', { from: prev, to: source });
+  }
+  meetSourceStats.lastSource = source;
+
+  if (now - meetSourceStats.lastMetricsLogAt > 10000) {
+    const snapshot = getMeetSourceStatsSnapshot();
+    mtLog('meet-source:metrics', {
+      epm: snapshot.epm,
+      totals: snapshot.totals,
+      lastSource: snapshot.lastSource,
+      lastSwitchAgoMs: snapshot.lastSwitchAgoMs
+    });
+    meetSourceStats.lastMetricsLogAt = now;
+  }
+}
+
+function markMeetCaptionActivity(source) {
+  lastMeetCaptionActivityAt = Date.now();
+  mtLog('meet-capture:activity', { source: source, at: lastMeetCaptionActivityAt });
+}
 
 if (PLATFORM === 'meet') {
   document.addEventListener('__mt_meet_device', (evt) => {
@@ -1147,7 +1256,8 @@ if (PLATFORM === 'meet') {
 
   document.addEventListener('__mt_meet_caption', (evt) => {
     if (!isRecording) return;
-    const { deviceId, messageId, messageVersion, text } = evt.detail || {};
+    const { deviceId, messageId, messageVersion, text, _source } = evt.detail || {};
+    trackMeetSourceActivity(_source || 'unknown');
     if (!text || !messageId) {
       mtWarn('meet-caption:skip-missing-required', {
         hasText: !!text,
@@ -1174,6 +1284,7 @@ if (PLATFORM === 'meet') {
         existing.text = cleanText;
         existing.name = speakerName;
         existing._rtcVersion = messageVersion;
+        markMeetCaptionActivity(_source || 'rtc-update');
         mtLog('meet-caption:update-entry', {
           messageId: messageId,
           messageVersion: messageVersion,
@@ -1184,6 +1295,7 @@ if (PLATFORM === 'meet') {
       }
     } else {
       transcript.push({ id: messageId, name: speakerName, text: cleanText, _rtcVersion: messageVersion });
+      markMeetCaptionActivity(_source || 'rtc-new');
       mtLog('meet-caption:new-entry', {
         messageId: messageId,
         messageVersion: messageVersion,
@@ -1196,18 +1308,14 @@ if (PLATFORM === 'meet') {
   });
 }
 
-// ── Google Meet: Caption Keeper + Visual Hide ────────────────
+// ── Google Meet: Visual Hide + Recovery ───────────────────────
 //
-// WHY THIS APPROACH:
-//   Google Meet's server only sends caption payload (both DOM content
-//   and WebRTC DataChannel frames) when captions are "on" in the UI.
-//   This is a server-side gate — we cannot bypass it by connecting to
-//   the transport layer alone (Tactiq uses the same technique).
+// IMPORTANT:
+//   Do not auto-click Meet's captions toggle. Users can close captions
+//   manually and the extension should respect that choice.
 //
-//   Solution: keep native captions always enabled via the toolbar button,
-//   but immediately hide the rendered caption overlay with injected CSS
-//   (opacity:0 + pointer-events:none). The elements remain in the DOM so
-//   our MutationObserver keeps reading them; the user sees nothing extra.
+//   Capture reliability is handled by RTC/DataChannel interception and
+//   recovery events below, not by forcing the captions UI state.
 //
 const MEET_CAPTION_HIDE_STYLE_ID = '__mt-caption-hide';
 
@@ -1244,13 +1352,163 @@ function removeMeetCaptionHideStyle() {
   }
 }
 
+function getMeetCaptionsToggleButton() {
+  return document.querySelector(
+    'button[jsname="r8qRAd"], ' +
+    'button[aria-label*="captions" i], ' +
+    'button[aria-label*="субтитр" i], ' +
+    'button[aria-label*="napis" i], ' +
+    'button[aria-label*="字幕" i]'
+  );
+}
+
+function isMeetCaptionsEnabled(btn) {
+  if (!btn) return null;
+  const ariaPressed = btn.getAttribute('aria-pressed');
+  if (ariaPressed === 'true') return true;
+  if (ariaPressed === 'false') return false;
+
+  const label = (btn.getAttribute('aria-label') || '').toLowerCase();
+  if (!label) return null;
+
+  // "turn on/show" => currently off, "turn off/hide" => currently on.
+  if (/turn on captions|enable captions|show captions|включить .*субтитр|показать .*субтитр|włącz napisy|字幕をオン/.test(label)) return false;
+  if (/turn off captions|disable captions|hide captions|выключить .*субтитр|скрыть .*субтитр|wyłącz napisy|字幕をオフ/.test(label)) return true;
+
+  return null;
+}
+
+function clearMeetCaptionBootstrapTimer() {
+  if (meetCaptionBootstrapTimer) {
+    clearInterval(meetCaptionBootstrapTimer);
+    meetCaptionBootstrapTimer = null;
+  }
+}
+
+function tryEnableMeetCaptionsOnRecordingStart(trigger) {
+  if (PLATFORM !== 'meet') return;
+  if (!isRecording) return;
+  if (!meetTryEnableCaptionsOnStart) return;
+  if (meetCaptionBootstrapAttemptedForSession) return;
+
+  meetCaptionBootstrapAttemptedForSession = true;
+  clearMeetCaptionBootstrapTimer();
+
+  let attempts = 0;
+  const maxAttempts = 6;
+
+  meetCaptionBootstrapTimer = setInterval(() => {
+    attempts += 1;
+
+    if (!isRecording) {
+      clearMeetCaptionBootstrapTimer();
+      return;
+    }
+
+    const inMeeting = !!document.querySelector(
+      'button[aria-label*="Leave call" i], button[aria-label*="Leave meeting" i], ' +
+      'button[aria-label*="встречу" i], button[aria-label*="Покинуть" i], ' +
+      '[data-idom-class*="leave" i]'
+    );
+
+    if (!inMeeting) {
+      if (attempts >= maxAttempts) {
+        mtWarn('caption-bootstrap:meeting-ui-not-ready', { trigger: trigger, attempts: attempts });
+        clearMeetCaptionBootstrapTimer();
+      }
+      return;
+    }
+
+    const ccBtn = getMeetCaptionsToggleButton();
+    if (!ccBtn) {
+      if (attempts >= maxAttempts) {
+        mtWarn('caption-bootstrap:button-not-found', { trigger: trigger, attempts: attempts });
+        clearMeetCaptionBootstrapTimer();
+      }
+      return;
+    }
+
+    const captionsEnabled = isMeetCaptionsEnabled(ccBtn);
+    if (captionsEnabled === true) {
+      mtLog('caption-bootstrap:already-enabled', { trigger: trigger, attempts: attempts });
+      clearMeetCaptionBootstrapTimer();
+      return;
+    }
+
+    if (captionsEnabled === false) {
+      suppressNextMeetCaptionToggleClick = true;
+      ccBtn.click();
+      setTimeout(() => {
+        suppressNextMeetCaptionToggleClick = false;
+      }, 800);
+      mtLog('caption-bootstrap:clicked-enable-once', {
+        trigger: trigger,
+        attempts: attempts,
+        btnLabel: ccBtn.getAttribute('aria-label') || '',
+        btnJsname: ccBtn.getAttribute('jsname') || '',
+        ariaPressed: ccBtn.getAttribute('aria-pressed')
+      });
+      clearMeetCaptionBootstrapTimer();
+      return;
+    }
+
+    if (attempts >= maxAttempts) {
+      // Ambiguous state in newer Meet can open settings popup; skip click.
+      mtWarn('caption-bootstrap:state-ambiguous-skip', {
+        trigger: trigger,
+        attempts: attempts,
+        btnLabel: ccBtn.getAttribute('aria-label') || '',
+        btnJsname: ccBtn.getAttribute('jsname') || '',
+        ariaPressed: ccBtn.getAttribute('aria-pressed')
+      });
+      clearMeetCaptionBootstrapTimer();
+    }
+  }, 1000);
+}
+
 if (PLATFORM === 'meet') {
-  let captionKeeperWarned = false;
+  let lastMeetRecoveryAt = 0;
+  let meetSoftRecoverCount = 0;
+  let lastMeetForcedRecoveryAt = 0;
+
+  document.addEventListener('click', (evt) => {
+    if (!isRecording) return;
+    if (!meetCaptionOverlayHidden) return;
+
+    const target = evt.target;
+    if (!(target instanceof Element)) return;
+
+    const ccBtn = target.closest(
+      'button[jsname="r8qRAd"], ' +
+      'button[aria-label*="captions" i], ' +
+      'button[aria-label*="субтитр" i], ' +
+      'button[aria-label*="napis" i], ' +
+      'button[aria-label*="字幕" i]'
+    );
+    if (!ccBtn) return;
+    if (suppressNextMeetCaptionToggleClick) return;
+
+    // Evaluate final state after Meet handles the click.
+    setTimeout(() => {
+      const enabled = isMeetCaptionsEnabled(ccBtn);
+      if (enabled === true) {
+        meetCaptionManualVisible = true;
+        mtLog('caption-keeper:manual-visible-on');
+      } else if (enabled === false) {
+        meetCaptionManualVisible = false;
+        mtLog('caption-keeper:manual-visible-off');
+      }
+    }, 120);
+  }, true);
+
+  document.addEventListener('__mt_meet_caption', () => {
+    meetSoftRecoverCount = 0;
+  });
 
   setInterval(() => {
     if (!isRecording) {
-      // Remove the hide overlay when not recording so the user can still
-      // use native captions independently.
+      // Remove the hide overlay when not recording so the user can use
+      // native captions independently.
       removeMeetCaptionHideStyle();
       return;
     }
@@ -1261,46 +1519,71 @@ if (PLATFORM === 'meet') {
       'button[aria-label*="встречу" i], button[aria-label*="Покинуть" i], ' +
       '[data-idom-class*="leave" i]'
     );
-    if (!inMeeting) return;
-
-    // Keep hide style continuously active during recording to avoid visible
-    // flashes while Meet mounts/remounts caption nodes.
-    injectMeetCaptionHideStyle();
-
-    // If caption panel elements are present, captions are already on.
-    const captionConfig = getCaptionConfig();
-    const captionsPresent = !!document.querySelector(captionConfig.container);
-
-    if (captionsPresent) {
-      captionKeeperWarned = false;
+    if (!inMeeting) {
+      removeMeetCaptionHideStyle();
       return;
     }
 
-    const ccBtn = document.querySelector(
-      'button[aria-label*="Turn on captions" i], ' +
-      'button[aria-label*="Enable captions" i], ' +
-      'button[aria-label*="Show captions" i], ' +
-      'button[aria-label*="Включить субтитры" i], ' +
-      'button[aria-label*="Включить скрытые субтитры" i], ' +
-      'button[aria-label*="Показать субтитры" i], ' +
-      'button[aria-label*="Włącz napisy" i], ' +
-      'button[aria-label*="字幕をオン" i], ' +
-      '[jsname="r8qRAd"][aria-pressed="false"], ' +
-      '[data-tooltip*="Turn on captions" i]'
-    );
-
-    if (ccBtn) {
-      mtLog('caption-keeper:re-enabling-meet-captions', {
-        btnLabel: ccBtn.getAttribute('aria-label') || '',
-        btnJsname: ccBtn.getAttribute('jsname') || ''
-      });
-      ccBtn.click();
-      captionKeeperWarned = false;
-    } else if (!captionKeeperWarned) {
-      mtLog('caption-keeper:captions-off-button-not-found-in-dom');
-      captionKeeperWarned = true;
+    // Tactiq-like behavior: visual visibility is user-configurable and
+    // independent from capture/recovery logic.
+    if (meetCaptionOverlayHidden && !meetCaptionManualVisible) {
+      injectMeetCaptionHideStyle();
+    } else {
+      removeMeetCaptionHideStyle();
     }
   }, 1500);
+
+  setInterval(() => {
+    if (!isRecording) return;
+
+    const inMeeting = !!document.querySelector(
+      'button[aria-label*="Leave call" i], button[aria-label*="Leave meeting" i], ' +
+      'button[aria-label*="встречу" i], button[aria-label*="Покинуть" i], ' +
+      '[data-idom-class*="leave" i]'
+    );
+    if (!inMeeting) return;
+
+    const now = Date.now();
+    const inactivityMs = now - lastMeetCaptionActivityAt;
+    if (inactivityMs < 12000) return;
+    if (now - lastMeetRecoveryAt < 12000) return;
+
+    lastMeetRecoveryAt = now;
+    meetSoftRecoverCount += 1;
+
+    mtWarn('meet-capture:inactivity-watchdog-recover', {
+      inactivityMs: inactivityMs,
+      transcriptLength: transcript.length
+    });
+
+    document.dispatchEvent(new CustomEvent('__mt_meet_recover_capture', {
+      detail: {
+        reason: 'caption-inactivity',
+        inactivityMs: inactivityMs,
+        transcriptLength: transcript.length
+      }
+    }));
+
+    // Escalation path (Tactiq-like): if soft recovery repeats and stream is
+    // still stalled, request forced RTC rotation in MAIN world.
+    if (meetSoftRecoverCount >= 2 && inactivityMs >= 30000 && now - lastMeetForcedRecoveryAt > 30000) {
+      lastMeetForcedRecoveryAt = now;
+      mtWarn('meet-capture:forced-rtc-recovery', {
+        inactivityMs: inactivityMs,
+        softRecoverCount: meetSoftRecoverCount,
+        transcriptLength: transcript.length
+      });
+
+      document.dispatchEvent(new CustomEvent('__mt_meet_force_rtc_reconnect', {
+        detail: {
+          reason: 'caption-inactivity-escalation',
+          inactivityMs: inactivityMs,
+          softRecoverCount: meetSoftRecoverCount,
+          transcriptLength: transcript.length
+        }
+      }));
+    }
+  }, 3000);
 }
 
 // ── Teams WebRTC Caption Fallback ───────────────────────────
@@ -1510,6 +1793,15 @@ function injectWidget() {
       background: #475569;
       flex-shrink: 0;
     }
+    .source-stats {
+      margin-top: 6px;
+      font-size: 11px;
+      color: #7dd3fc;
+      opacity: .95;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
     .status.recording .dot {
       background: #ef4444;
       box-shadow: 0 0 8px rgba(239,68,68,.6);
@@ -1610,6 +1902,7 @@ function injectWidget() {
           <span class="dot"></span>
           <span class="status-text">Ожидание...</span>
         </div>
+        <div class="source-stats" id="sourceStats">src/min: -</div>
       </div>
       <div class="panel-actions">
         <button class="btn btn-primary" id="toggleRecord">Начать запись</button>
@@ -1631,6 +1924,7 @@ function injectWidget() {
   const clearBtn = shadow.getElementById('clearBtn');
   const statusEl = shadow.getElementById('status');
   const statusText = statusEl.querySelector('.status-text');
+  const sourceStatsEl = shadow.getElementById('sourceStats');
   const transcriptPreview = shadow.getElementById('transcriptPreview');
 
   function legacyCopyToClipboard(text) {
@@ -1787,6 +2081,16 @@ function injectWidget() {
     }
 
     toggleRecordBtn.disabled = false;
+
+    if (PLATFORM === 'meet') {
+      const stats = getMeetSourceStatsSnapshot();
+      const lastSwitchSec = stats.lastSwitchAgoMs == null ? '-' : Math.floor(stats.lastSwitchAgoMs / 1000) + 's';
+      sourceStatsEl.textContent =
+        `src/min c:${stats.epm.captions} m:${stats.epm.meet_messages} f:${stats.epm.create_meeting_message} | last:${stats.lastSource || '-'} (${lastSwitchSec})`;
+      sourceStatsEl.style.display = 'block';
+    } else {
+      sourceStatsEl.style.display = 'none';
+    }
 
     // Status
     if (isRecording) {

@@ -469,6 +469,32 @@
   var activePeerConnection = null;
   var activeCaptionsChannel = null;
   var captionsMonitorStarted = false;
+  var knownPeerConnections = [];
+
+  function rememberPeerConnection(pc) {
+    if (!pc) return;
+    for (var i = 0; i < knownPeerConnections.length; i++) {
+      if (knownPeerConnections[i].pc === pc) return;
+    }
+    knownPeerConnections.push({ pc: pc, seenAt: Date.now() });
+    if (knownPeerConnections.length > 8) knownPeerConnections.shift();
+  }
+
+  function getBestPeerConnection() {
+    for (var i = knownPeerConnections.length - 1; i >= 0; i--) {
+      var candidate = knownPeerConnections[i] && knownPeerConnections[i].pc;
+      if (!candidate) continue;
+      var st = candidate.connectionState;
+      if (st !== 'closed' && st !== 'failed') return candidate;
+    }
+    return null;
+  }
+
+  function dispatchCaption(msg, source) {
+    if (!msg) return;
+    if (source) msg._source = source;
+    document.dispatchEvent(new CustomEvent('__mt_meet_caption', { detail: msg }));
+  }
 
   function startCaptionsMonitor() {
     if (captionsMonitorStarted) return;
@@ -486,7 +512,15 @@
         channelState: state,
         pcState: activePeerConnection.connectionState
       });
-      attachCaptionsChannel(activePeerConnection);
+      var bestPc = getBestPeerConnection() || activePeerConnection;
+      if (bestPc !== activePeerConnection) {
+        warn('captions-monitor:switch-active-peer-connection', {
+          fromState: activePeerConnection && activePeerConnection.connectionState,
+          toState: bestPc.connectionState
+        });
+        activePeerConnection = bestPc;
+      }
+      attachCaptionsChannel(bestPc);
     }, 5000);
   }
 
@@ -528,7 +562,7 @@
               version: msg.messageVersion,
               textLength: msg.text.length
             });
-            document.dispatchEvent(new CustomEvent('__mt_meet_caption', { detail: msg }));
+            dispatchCaption(msg, 'captions');
           } else {
             warn('captions-message-skip:decode-null', { bytes: data.length });
           }
@@ -545,8 +579,17 @@
   function WrapRTC(config, constraints) {
     log('rtc-wrap:new-connection');
     var pc = new OrigRTC(config, constraints);
+    rememberPeerConnection(pc);
     activePeerConnection = pc;
     startCaptionsMonitor();
+
+    pc.addEventListener('connectionstatechange', function () {
+      var state = pc.connectionState || 'unknown';
+      log('rtc-connectionstatechange', { state: state });
+      if (state === 'connected' || state === 'connecting') {
+        activePeerConnection = pc;
+      }
+    });
 
     // Server-created channels arrive here
     pc.addEventListener('datachannel', function (evt) {
@@ -606,7 +649,7 @@
                 version: msg.messageVersion,
                 textLength: msg.text.length
               });
-              document.dispatchEvent(new CustomEvent('__mt_meet_caption', { detail: msg }));
+              dispatchCaption(msg, 'meet_messages');
             } else {
               dbg('meet_messages-skip:decode-null', { bytes: data.length });
             }
@@ -674,7 +717,7 @@
                 version: msg.messageVersion,
                 textLength: msg.text.length
               });
-              document.dispatchEvent(new CustomEvent('__mt_meet_caption', { detail: msg }));
+              dispatchCaption(msg, 'create_meeting_message');
             } else {
               dbg('fetch-create-meeting-message:decode-null', { bytes: u8.length });
             }
@@ -689,6 +732,56 @@
 
     return p;
   };
+
+  document.addEventListener('__mt_meet_recover_capture', function (evt) {
+    var detail = (evt && evt.detail) ? evt.detail : {};
+    if (!activePeerConnection) {
+      activePeerConnection = getBestPeerConnection();
+      if (!activePeerConnection) {
+        warn('recover-capture:skip-no-active-peer-connection', detail);
+        return;
+      }
+    }
+
+    if (activePeerConnection.connectionState === 'closed' || activePeerConnection.connectionState === 'failed') {
+      warn('recover-capture:skip-peer-connection-not-usable', {
+        pcState: activePeerConnection.connectionState,
+        reason: detail.reason || 'unknown'
+      });
+      activePeerConnection = getBestPeerConnection();
+      if (!activePeerConnection) return;
+    }
+
+    warn('recover-capture:reattach-captions-channel', {
+      reason: detail.reason || 'unknown',
+      inactivityMs: detail.inactivityMs || 0,
+      pcState: activePeerConnection.connectionState,
+      hadActiveChannel: !!activeCaptionsChannel,
+      activeChannelState: activeCaptionsChannel ? activeCaptionsChannel.readyState : 'none'
+    });
+
+    // Drop stale reference so monitor/recovery can promote a fresh channel.
+    activeCaptionsChannel = null;
+    attachCaptionsChannel(activePeerConnection);
+  });
+
+  document.addEventListener('__mt_meet_force_rtc_reconnect', function (evt) {
+    var detail = (evt && evt.detail) ? evt.detail : {};
+    var nextPc = getBestPeerConnection();
+    if (!nextPc) {
+      warn('force-rtc-reconnect:skip-no-peer-connection', detail);
+      return;
+    }
+
+    activePeerConnection = nextPc;
+    activeCaptionsChannel = null;
+    warn('force-rtc-reconnect:rotate-active-peer-connection', {
+      reason: detail.reason || 'unknown',
+      inactivityMs: detail.inactivityMs || 0,
+      pcState: nextPc.connectionState
+    });
+    attachCaptionsChannel(nextPc);
+  });
 
   log('init-complete');
 

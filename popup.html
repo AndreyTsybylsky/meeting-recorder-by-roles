@@ -37,6 +37,7 @@
       font-size: 15px;
       font-weight: 700;
       background: linear-gradient(135deg, #c7d2fe, #a78bfa);
+      background-clip: text;
       -webkit-background-clip: text;
       -webkit-text-fill-color: transparent;
     }
@@ -502,6 +503,29 @@
     </div>
     <label class="sw">
       <input type="checkbox" id="autoRecordToggle">
+      <span class="sw-slider"></span>
+    </label>
+  </div>
+
+  <!-- Meet captions visibility toggle (Tactiq-like: capture continues, UI can stay hidden) -->
+  <div class="sidebar-row">
+    <div>
+      <div class="sidebar-row-label">Скрывать captions в Google Meet</div>
+      <div class="sidebar-row-hint">Запись продолжается, даже если нативные captions не видны</div>
+    </div>
+    <label class="sw">
+      <input type="checkbox" id="meetCaptionOverlayToggle">
+      <span class="sw-slider"></span>
+    </label>
+  </div>
+
+  <div class="sidebar-row">
+    <div>
+      <div class="sidebar-row-label">Включать captions при старте записи</div>
+      <div class="sidebar-row-hint">Одна попытка в начале сессии (без постоянного переоткрытия)</div>
+    </div>
+    <label class="sw">
+      <input type="checkbox" id="meetCaptionBootstrapToggle">
       <span class="sw-slider"></span>
     </label>
   </div>
