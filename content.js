@@ -190,6 +190,7 @@ let meetTryEnableCaptionsOnStart = false; // Optional bootstrap: try enabling ca
 let meetCaptionBootstrapAttemptedForSession = false;
 let meetCaptionBootstrapTimer = null;
 let meetCaptionManualVisible = false;
+let meetCaptionEnabledByBootstrap = false;
 let suppressNextMeetCaptionToggleClick = false;
 // Guard: only trigger "meeting ended" detection after the meeting container has been
 // seen at least once. Prevents false-positive stopAndSave() on initial page load
@@ -642,6 +643,8 @@ safeStorageGet([RECORDING_STORAGE_KEY, TRANSCRIPT_STORAGE_KEY, 'isRecording', 't
       isRecording = true;
       currentSessionId = Date.now().toString();
       transcript = [];
+      meetCaptionManualVisible = false;
+      meetCaptionEnabledByBootstrap = false;
       meetCaptionBootstrapAttemptedForSession = false;
       ensureCaptionObserverAttached();
       setScopedRecordingState(true, []);
@@ -727,6 +730,7 @@ if (isExtensionContextAvailable()) {
           currentSessionId = Date.now().toString();
           transcript = [];
           meetCaptionManualVisible = false;
+          meetCaptionEnabledByBootstrap = false;
           meetCaptionBootstrapAttemptedForSession = false;
           ensureCaptionObserverAttached();
           setScopedRecordingState(true, []);
@@ -741,6 +745,7 @@ if (isExtensionContextAvailable()) {
           finalizeSession();
           transcript = [];
           meetCaptionManualVisible = false;
+          meetCaptionEnabledByBootstrap = false;
           clearMeetCaptionBootstrapTimer();
           meetCaptionBootstrapAttemptedForSession = false;
           setScopedRecordingState(false, []);
@@ -1323,17 +1328,21 @@ function injectMeetCaptionHideStyle() {
   if (document.getElementById(MEET_CAPTION_HIDE_STYLE_ID)) return;
   const style = document.createElement('style');
   style.id = MEET_CAPTION_HIDE_STYLE_ID;
-  // Target both the individual segments and any known outer wrappers.
+  // Target only nodes rendered inside Meet's aria-live caption overlays.
+  // This avoids broad class selectors that can hide unrelated/new containers
+  // when Meet changes internal DOM structure.
   // opacity:0 keeps the elements in the layout tree (MutationObserver
   // still fires), display/visibility changes can sometimes affect Meet's
   // internal state so we deliberately avoid them.
   style.textContent = `
     [aria-live="polite"] [jsname="W297wb"],
     [aria-live="assertive"] [jsname="W297wb"],
-    div[jsname="W297wb"],
-    .iY996, .V006ub, .nS7Zeb,
-    .nMcdL, [jsname="YSZ4cc"], [jsname="Vpvi7b"],
-    [jsname="dsyhDe"], .a4cQT > [jsname] > [class*="caption" i] {
+    [aria-live="polite"] .nMcdL,
+    [aria-live="assertive"] .nMcdL,
+    [aria-live="polite"] [jsname="YSZ4cc"],
+    [aria-live="assertive"] [jsname="YSZ4cc"],
+    [aria-live="polite"] [jsname="Vpvi7b"],
+    [aria-live="assertive"] [jsname="Vpvi7b"] {
       opacity: 0 !important;
       visibility: hidden !important;
       pointer-events: none !important;
@@ -1430,12 +1439,14 @@ function tryEnableMeetCaptionsOnRecordingStart(trigger) {
 
     const captionsEnabled = isMeetCaptionsEnabled(ccBtn);
     if (captionsEnabled === true) {
+      meetCaptionEnabledByBootstrap = false;
       mtLog('caption-bootstrap:already-enabled', { trigger: trigger, attempts: attempts });
       clearMeetCaptionBootstrapTimer();
       return;
     }
 
     if (captionsEnabled === false) {
+      meetCaptionEnabledByBootstrap = true;
       suppressNextMeetCaptionToggleClick = true;
       ccBtn.click();
       setTimeout(() => {
@@ -1492,9 +1503,11 @@ if (PLATFORM === 'meet') {
     setTimeout(() => {
       const enabled = isMeetCaptionsEnabled(ccBtn);
       if (enabled === true) {
+        meetCaptionEnabledByBootstrap = false;
         meetCaptionManualVisible = true;
         mtLog('caption-keeper:manual-visible-on');
       } else if (enabled === false) {
+        meetCaptionEnabledByBootstrap = false;
         meetCaptionManualVisible = false;
         mtLog('caption-keeper:manual-visible-off');
       }
@@ -1522,6 +1535,18 @@ if (PLATFORM === 'meet') {
     if (!inMeeting) {
       removeMeetCaptionHideStyle();
       return;
+    }
+
+    // Keep local state in sync even when user toggles captions via keyboard or
+    // Meet menus (paths where a direct CC button click event may not fire).
+    const ccBtn = getMeetCaptionsToggleButton();
+    const captionsEnabled = isMeetCaptionsEnabled(ccBtn);
+    if (captionsEnabled === false) {
+      meetCaptionManualVisible = false;
+      meetCaptionEnabledByBootstrap = false;
+    } else if (captionsEnabled === true && !meetCaptionEnabledByBootstrap && !meetCaptionManualVisible) {
+      meetCaptionManualVisible = true;
+      mtLog('caption-keeper:auto-detected-manual-visible-on');
     }
 
     // Tactiq-like behavior: visual visibility is user-configurable and
