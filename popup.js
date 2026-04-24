@@ -80,13 +80,39 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
-  // Find active meeting tab
-  chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-    const tab = tabs && tabs[0];
-    if (tab && isMeetingUrl(tab.url)) {
-      queryRecordingState(tab.id);
-    }
-  });
+  function resolveMeetingTabAndInitStrip() {
+    // 1) Preferred: active tab in last focused browser window.
+    chrome.tabs.query({ active: true, lastFocusedWindow: true }, (tabs) => {
+      const activeTab = tabs && tabs[0];
+      if (activeTab && isMeetingUrl(activeTab.url)) {
+        queryRecordingState(activeTab.id);
+        return;
+      }
+
+      // 2) Fallback: any active tab in current window.
+      chrome.tabs.query({ active: true, currentWindow: true }, (tabs2) => {
+        const currentActive = tabs2 && tabs2[0];
+        if (currentActive && isMeetingUrl(currentActive.url)) {
+          queryRecordingState(currentActive.id);
+          return;
+        }
+
+        // 3) Last-resort fallback: find any open meeting tab and bind to it.
+        chrome.tabs.query({}, (allTabs) => {
+          const meetingTab = (allTabs || []).find(t => isMeetingUrl(t.url));
+          if (meetingTab) {
+            queryRecordingState(meetingTab.id);
+            return;
+          }
+          activeMeetingTabId = null;
+          updateRecordStrip(false, false);
+        });
+      });
+    });
+  }
+
+  // Find meeting tab robustly (popup focus can make currentWindow unreliable).
+  resolveMeetingTabAndInitStrip();
 
   recordBtn.addEventListener('click', () => {
     if (activeMeetingTabId === null) return;

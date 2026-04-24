@@ -913,7 +913,17 @@ setInterval(() => {
       return;
     }
 
-    if (meetingContainerEverSeen && !leaveBtn && !meetingContainer) {
+    if (PLATFORM === 'meet' && meetingContainerEverSeen && !leaveBtn && !meetingContainer) {
+      // Meet can transiently remount call controls/canvas while still active.
+      // Do not auto-stop recording on missing UI for Meet; rely on explicit
+      // ended screen or beforeunload/manual stop instead.
+      meetingUiMissingStreak += 1;
+      mtLog('meeting-monitor:meet-ui-missing-ignored', {
+        streak: meetingUiMissingStreak,
+        leaveBtn: !!leaveBtn,
+        meetingContainer: !!meetingContainer
+      });
+    } else if (meetingContainerEverSeen && !leaveBtn && !meetingContainer) {
       meetingUiMissingStreak += 1;
       mtWarn('meeting-monitor:ui-missing-tick', {
         streak: meetingUiMissingStreak,
@@ -969,7 +979,7 @@ const captionObserver = new MutationObserver((mutations) => {
       // Use textContent (not innerText) so hidden/off-screen caption elements are still read.
       let speechText = textEl ? textEl.textContent.trim() : blockContainer.textContent.trim();
       if (!speechText) {
-        mtWarn('mutation-observer:skip-empty-text');
+        mtLog('mutation-observer:skip-empty-text');
         continue;
       }
 
@@ -995,7 +1005,7 @@ const captionObserver = new MutationObserver((mutations) => {
 
       speechText = sanitizeSpeechText(speakerName, speechText);
       if (!speechText) {
-        mtWarn('mutation-observer:skip-sanitized-empty');
+        mtLog('mutation-observer:skip-sanitized-empty');
         continue;
       }
 
@@ -1280,14 +1290,14 @@ if (PLATFORM === 'meet') {
     );
 
     if (ccBtn) {
-      mtWarn('caption-keeper:re-enabling-meet-captions', {
+      mtLog('caption-keeper:re-enabling-meet-captions', {
         btnLabel: ccBtn.getAttribute('aria-label') || '',
         btnJsname: ccBtn.getAttribute('jsname') || ''
       });
       ccBtn.click();
       captionKeeperWarned = false;
     } else if (!captionKeeperWarned) {
-      mtWarn('caption-keeper:captions-off-button-not-found-in-dom');
+      mtLog('caption-keeper:captions-off-button-not-found-in-dom');
       captionKeeperWarned = true;
     }
   }, 1500);

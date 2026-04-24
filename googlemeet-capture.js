@@ -36,6 +36,14 @@
     console.warn('[MeetTranscriber][meet-capture] ' + step, details);
   }
 
+  function dbg(step, details) {
+    if (details === undefined) {
+      console.debug('[MeetTranscriber][meet-capture] ' + step);
+      return;
+    }
+    console.debug('[MeetTranscriber][meet-capture] ' + step, details);
+  }
+
   function err(step, error) {
     console.error('[MeetTranscriber][meet-capture] ' + step, error);
   }
@@ -348,7 +356,7 @@
           });
           return fallbackMsg;
         }
-        warn('caption-decode-skip:missing-required', {
+        dbg('caption-decode-skip:missing-required', {
           hasDeviceId: !!deviceId,
           messageId: messageId,
           messageVersion: messageVer,
@@ -398,7 +406,7 @@
       var deviceId   = d[1] && d[1][0] ? str(d[1][0].v) : '';
       var deviceName = d[2] && d[2][0] ? str(d[2][0].v) : '';
       if (!deviceId || !deviceName) {
-        warn('device-decode-skip:missing-required', {
+        dbg('device-decode-skip:missing-required', {
           hasDeviceId: !!deviceId,
           hasDeviceName: !!deviceName
         });
@@ -559,7 +567,7 @@
           decompress(u8).then(function (data) {
             var info = decodeDeviceFrame(data);
             if (info) dispatchDevice(info);
-            else warn('collections-message-skip:decode-null', { bytes: data.length });
+            else dbg('collections-message-skip:decode-null', { bytes: data.length });
           }).catch(function (e) {
             err('collections-message:decompress-promise-error', e);
           });
@@ -600,7 +608,7 @@
               });
               document.dispatchEvent(new CustomEvent('__mt_meet_caption', { detail: msg }));
             } else {
-              warn('meet_messages-skip:decode-null', { bytes: data.length });
+              dbg('meet_messages-skip:decode-null', { bytes: data.length });
             }
           }).catch(function (e) {
             err('meet_messages:decompress-promise-error', e);
@@ -668,7 +676,7 @@
               });
               document.dispatchEvent(new CustomEvent('__mt_meet_caption', { detail: msg }));
             } else {
-              warn('fetch-create-meeting-message:decode-null', { bytes: u8.length });
+              dbg('fetch-create-meeting-message:decode-null', { bytes: u8.length });
             }
           } catch (e) {
             warn('fetch-create-meeting-message:parse-failed', e && e.message ? e.message : e);
