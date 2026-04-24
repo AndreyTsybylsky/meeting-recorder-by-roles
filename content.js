@@ -1160,6 +1160,62 @@ if (PLATFORM === 'meet') {
   });
 }
 
+// ── Google Meet: Caption Keeper ──────────────────────────────
+// Google Meet stops sending caption data (both DOM mutations AND the
+// WebRTC captions data-channel) as soon as the built-in caption UI
+// panel is closed. This watcher re-enables the native caption panel
+// automatically while recording is active, so the transcript never
+// silently stops capturing mid-meeting.
+if (PLATFORM === 'meet') {
+  let captionKeeperWarned = false;
+
+  setInterval(() => {
+    if (!isRecording) return;
+
+    // Only act while we're confirmed to be inside an active call.
+    const inMeeting = !!document.querySelector(
+      'button[aria-label*="Leave call" i], button[aria-label*="Leave meeting" i], ' +
+      'button[aria-label*="встречу" i], button[aria-label*="Покинуть" i], ' +
+      '[data-idom-class*="leave" i]'
+    );
+    if (!inMeeting) return;
+
+    // If any caption panel element exists, captions are already on.
+    const captionConfig = getCaptionConfig();
+    const captionsPresent = !!document.querySelector(captionConfig.container);
+    if (captionsPresent) {
+      captionKeeperWarned = false; // reset so next closure is logged
+      return;
+    }
+
+    // Caption panel is absent — try to click the "Turn on captions" button.
+    const ccBtn = document.querySelector(
+      'button[aria-label*="Turn on captions" i], ' +
+      'button[aria-label*="Enable captions" i], ' +
+      'button[aria-label*="Show captions" i], ' +
+      'button[aria-label*="Включить субтитры" i], ' +
+      'button[aria-label*="Включить скрытые субтитры" i], ' +
+      'button[aria-label*="Показать субтитры" i], ' +
+      'button[aria-label*="Włącz napisy" i], ' +
+      'button[aria-label*="字幕をオン" i], ' +
+      '[jsname="r8qRAd"][aria-pressed="false"], ' +
+      '[data-tooltip*="Turn on captions" i]'
+    );
+
+    if (ccBtn) {
+      mtWarn('caption-keeper:re-enabling-meet-captions', {
+        btnLabel: ccBtn.getAttribute('aria-label') || '',
+        btnJsname: ccBtn.getAttribute('jsname') || ''
+      });
+      ccBtn.click();
+      captionKeeperWarned = false;
+    } else if (!captionKeeperWarned) {
+      mtWarn('caption-keeper:captions-off-button-not-found-in-dom');
+      captionKeeperWarned = true;
+    }
+  }, 1500);
+}
+
 // ── Teams WebRTC Caption Fallback ───────────────────────────
 // When the Teams caption panel is closed the DOM emits no mutations.
 // teams-capture.js (MAIN world) intercepts the WebRTC main-channel and
