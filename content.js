@@ -5,6 +5,31 @@
 
 const PLATFORM = detectPlatform();
 
+function mtLog(step, details) {
+  if (details === undefined) {
+    console.log('[MeetTranscriber][content][' + PLATFORM + '] ' + step);
+    return;
+  }
+  console.log('[MeetTranscriber][content][' + PLATFORM + '] ' + step, details);
+}
+
+function mtWarn(step, details) {
+  if (details === undefined) {
+    console.warn('[MeetTranscriber][content][' + PLATFORM + '] ' + step);
+    return;
+  }
+  console.warn('[MeetTranscriber][content][' + PLATFORM + '] ' + step, details);
+}
+
+function mtError(step, error) {
+  console.error('[MeetTranscriber][content][' + PLATFORM + '] ' + step, error);
+}
+
+mtLog('script-init', {
+  url: window.location.href,
+  title: document.title
+});
+
 const CAPTION_SELECTORS = {
   meet: {
     container: 'div[jsname="W297wb"], .iY996, .V006ub, .nS7Zeb, .nMcdL, [jsname="YSZ4cc"]',
@@ -130,17 +155,22 @@ function shouldShowWidget() {
 }
 
 function ensureWidgetState() {
-  if (shouldShowWidget()) {
+  const shouldShow = shouldShowWidget();
+  mtLog('ensureWidgetState', { shouldShow: shouldShow, hasWidget: !!widgetHost });
+  if (shouldShow) {
     if (!widgetHost || !document.body.contains(widgetHost)) {
+      mtLog('widget-inject:trigger');
       injectWidget();
     }
     return;
   }
 
+  mtWarn('widget-destroy:should-hide');
   destroyWidget();
 }
 
 function destroyWidget() {
+  mtLog('widget-destroy:start', { hadWidget: !!widgetHost });
   if (widgetHost && widgetHost.parentNode) {
     widgetHost.parentNode.removeChild(widgetHost);
   }
@@ -181,6 +211,13 @@ function getMeetingCode() {
 
   return 'unknown';
 }
+
+mtLog('platform-detected', {
+  platform: PLATFORM,
+  meetingCode: getMeetingCode(),
+  locationPath: window.location.pathname,
+  locationHash: window.location.hash
+});
 
 let memoizedMeetingTitle = null;
 let memoizedUserName = null;
@@ -476,7 +513,11 @@ function safeStorageSet(payload, callback) {
   }
 
   try {
+    mtLog('storage.set', { keys: Object.keys(payload || {}) });
     chrome.storage.local.set(payload, () => {
+      if (chrome.runtime && chrome.runtime.lastError) {
+        mtWarn('storage.set:lastError', chrome.runtime.lastError.message || 'unknown');
+      }
       if (typeof callback === 'function') callback();
     });
   } catch (e) {
@@ -493,7 +534,12 @@ function safeStorageGet(keys, callback) {
   }
 
   try {
+    mtLog('storage.get', { keys: keys });
     chrome.storage.local.get(keys, (res) => {
+      if (chrome.runtime && chrome.runtime.lastError) {
+        mtWarn('storage.get:lastError', chrome.runtime.lastError.message || 'unknown');
+      }
+      mtLog('storage.get:done', { keys: Object.keys(res || {}) });
       callback(res || {});
     });
   } catch (e) {
@@ -510,6 +556,7 @@ function safeSendMessage(message, callback) {
   }
 
   try {
+    mtLog('runtime.sendMessage', { type: message && message.type ? message.type : 'unknown' });
     chrome.runtime.sendMessage(message, () => {
       if (typeof callback === 'function') {
         let ok = true;
@@ -532,6 +579,10 @@ function safeSendMessage(message, callback) {
 }
 
 function setScopedRecordingState(nextIsRecording, nextTranscript) {
+  mtLog('setScopedRecordingState', {
+    nextIsRecording: nextIsRecording,
+    transcriptLength: Array.isArray(nextTranscript) ? nextTranscript.length : -1
+  });
   storageStateTouchedLocally = true;
   safeStorageSet({
     [RECORDING_STORAGE_KEY]: nextIsRecording,
@@ -543,6 +594,15 @@ function setScopedRecordingState(nextIsRecording, nextTranscript) {
 safeStorageGet([RECORDING_STORAGE_KEY, TRANSCRIPT_STORAGE_KEY, 'isRecording', 'transcript', 'sidebarEnabled', 'autoRecordEnabled'], (res) => {
   const scopedIsRecording = res[RECORDING_STORAGE_KEY];
   const scopedTranscript = res[TRANSCRIPT_STORAGE_KEY];
+
+  mtLog('storage-init:received', {
+    scopedIsRecording: scopedIsRecording,
+    scopedTranscriptLength: Array.isArray(scopedTranscript) ? scopedTranscript.length : -1,
+    legacyIsRecording: res.isRecording,
+    legacyTranscriptLength: Array.isArray(res.transcript) ? res.transcript.length : -1,
+    sidebarEnabled: res.sidebarEnabled,
+    autoRecordEnabled: res.autoRecordEnabled
+  });
 
   // Resolve autoRecordEnabled setting (default true if never set)
   autoRecordEnabled = res.autoRecordEnabled !== undefined ? !!res.autoRecordEnabled : true;
@@ -556,10 +616,12 @@ safeStorageGet([RECORDING_STORAGE_KEY, TRANSCRIPT_STORAGE_KEY, 'isRecording', 't
     if (scopedIsRecording === true) {
       // Resume an in-progress recording (e.g. page reload mid-session).
       isRecording = true;
+      mtLog('storage-init:resume-scoped-recording');
     } else if (scopedIsRecording === undefined && res.isRecording === true) {
       // Migrate legacy global true state into scoped state.
       isRecording = true;
       safeStorageSet({ [RECORDING_STORAGE_KEY]: true });
+      mtLog('storage-init:migrate-legacy-recording-flag');
     } else if (autoRecordEnabled) {
       // Auto-start: fresh join OR rejoining after a previous session was stopped.
       isRecording = true;
@@ -567,20 +629,29 @@ safeStorageGet([RECORDING_STORAGE_KEY, TRANSCRIPT_STORAGE_KEY, 'isRecording', 't
       transcript = [];
       ensureCaptionObserverAttached();
       setScopedRecordingState(true, []);
+      mtLog('storage-init:auto-start-enabled', { sessionId: currentSessionId });
     }
 
     // Restore transcript only if we are resuming (not fresh auto-start).
     if (!autoRecordEnabled || scopedIsRecording === true) {
       if (Array.isArray(scopedTranscript)) {
         transcript = scopedTranscript;
+        mtLog('storage-init:restored-scoped-transcript', { length: transcript.length });
       } else if (Array.isArray(res.transcript)) {
         transcript = res.transcript;
         safeStorageSet({ [TRANSCRIPT_STORAGE_KEY]: transcript });
+        mtLog('storage-init:migrated-legacy-transcript', { length: transcript.length });
       }
     }
   }
 
   storageStateInitialized = true;
+  mtLog('storage-init:complete', {
+    isRecording: isRecording,
+    transcriptLength: transcript.length,
+    sidebarEnabled: sidebarEnabled,
+    autoRecordEnabled: autoRecordEnabled
+  });
   refreshUI();
 });
 
@@ -588,17 +659,22 @@ if (isExtensionContextAvailable()) {
   try {
     chrome.storage.onChanged.addListener((changes, area) => {
       if (area === 'local') {
+        mtLog('storage.onChanged', { keys: Object.keys(changes || {}) });
         if (changes[RECORDING_STORAGE_KEY] !== undefined) {
           isRecording = changes[RECORDING_STORAGE_KEY].newValue;
+          mtLog('storage.onChanged:recording', { isRecording: isRecording });
         }
         if (changes[TRANSCRIPT_STORAGE_KEY] !== undefined) {
           transcript = changes[TRANSCRIPT_STORAGE_KEY].newValue;
+          mtLog('storage.onChanged:transcript', { length: Array.isArray(transcript) ? transcript.length : -1 });
         }
         if (changes['sidebarEnabled'] !== undefined) {
           sidebarEnabled = !!changes['sidebarEnabled'].newValue;
+          mtLog('storage.onChanged:sidebarEnabled', { sidebarEnabled: sidebarEnabled });
         }
         if (changes['autoRecordEnabled'] !== undefined) {
           autoRecordEnabled = !!changes['autoRecordEnabled'].newValue;
+          mtLog('storage.onChanged:autoRecordEnabled', { autoRecordEnabled: autoRecordEnabled });
         }
         refreshUI();
       }
@@ -612,6 +688,7 @@ if (isExtensionContextAvailable()) {
 if (isExtensionContextAvailable()) {
   try {
     chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+      mtLog('runtime.onMessage', { type: message && message.type ? message.type : 'unknown' });
       if (message.type === 'GET_RECORDING_STATE') {
         sendResponse({ isRecording, initialized: storageStateInitialized });
         return false;
@@ -624,11 +701,13 @@ if (isExtensionContextAvailable()) {
           transcript = [];
           ensureCaptionObserverAttached();
           setScopedRecordingState(true, []);
+          mtLog('recording-start:manual-toggle', { sessionId: currentSessionId });
           // Close the transcript panel if the widget is already injected
           if (typeof window.__meetTranscriberSetPanelOpen === 'function') {
             window.__meetTranscriberSetPanelOpen(false);
           }
         } else {
+          mtWarn('recording-stop:manual-toggle', { transcriptLength: transcript.length });
           finalizeSession();
           transcript = [];
           setScopedRecordingState(false, []);
@@ -648,7 +727,9 @@ let saveTimeout;
 function saveTranscript() {
   storageStateTouchedLocally = true;
   clearTimeout(saveTimeout);
+  mtLog('saveTranscript:scheduled', { transcriptLength: transcript.length });
   saveTimeout = setTimeout(() => {
+    mtLog('saveTranscript:flush', { transcriptLength: transcript.length });
     safeStorageSet({ [TRANSCRIPT_STORAGE_KEY]: transcript });
     refreshUI();
   }, 500);
@@ -656,7 +737,14 @@ function saveTranscript() {
 
 // ── Session Auto-Save ───────────────────────────────────────
 function finalizeSession() {
-  if (transcript.length === 0) return;
+  mtLog('finalizeSession:start', {
+    transcriptLength: transcript.length,
+    currentSessionId: currentSessionId
+  });
+  if (transcript.length === 0) {
+    mtWarn('finalizeSession:skip-empty-transcript');
+    return;
+  }
   
   if (!currentSessionId) {
     currentSessionId = Date.now().toString();
@@ -706,10 +794,21 @@ function finalizeSession() {
     phraseCount: transcript.length,
     transcript: merged
   };
+  mtLog('finalizeSession:prepared', {
+    sessionId: session.id,
+    phraseCount: session.phraseCount,
+    meetingCode: session.meetingCode,
+    title: session.title
+  });
   
   // Send to background for persistent storage, fallback to local list if messaging fails.
   safeSendMessage({ type: 'SAVE_SESSION', session }, (ok) => {
-    if (ok) return;
+    if (ok) {
+      mtLog('finalizeSession:save-via-background-ok', { sessionId: session.id });
+      return;
+    }
+
+    mtWarn('finalizeSession:save-via-background-failed:fallback-storage', { sessionId: session.id });
 
     safeStorageGet(['sessions'], (res) => {
       const sessions = res.sessions || [];
@@ -718,27 +817,39 @@ function finalizeSession() {
       else sessions.unshift(session);
       if (sessions.length > 50) sessions.length = 50;
       safeStorageSet({ sessions });
+      mtLog('finalizeSession:fallback-saved', { totalSessions: sessions.length, sessionId: session.id });
     });
   });
 }
 
 // Auto-save when leaving the page or meeting ends
-function stopAndSave() {
-  if (!isRecording) return;
+function stopAndSave(reason) {
+  mtWarn('stopAndSave:called', {
+    reason: reason || 'unspecified',
+    isRecording: isRecording,
+    transcriptLength: transcript.length,
+    meetingContainerEverSeen: meetingContainerEverSeen
+  });
+  if (!isRecording) {
+    mtWarn('stopAndSave:skip-not-recording', { reason: reason || 'unspecified' });
+    return;
+  }
   finalizeSession();
   isRecording = false;
   setScopedRecordingState(false, []);
   currentSessionId = null;
+  mtWarn('stopAndSave:recording-stopped', { reason: reason || 'unspecified' });
   refreshUI();
 }
 
-window.addEventListener('beforeunload', stopAndSave);
+window.addEventListener('beforeunload', () => stopAndSave('beforeunload'));
 
 // Monitor if the meeting is still active
 setInterval(() => {
   if (isRecording) {
     // 1. Every 30s save progress to history without stopping (heartbeat)
     if (transcript.length > 0 && Date.now() % 30000 < 3000) {
+       mtLog('recording-heartbeat:finalizeSession');
        finalizeSession();
     }
 
@@ -773,15 +884,36 @@ setInterval(() => {
     // Track when we first see the meeting container so we don't false-fire on load
     if (meetingContainer || leaveBtn) meetingContainerEverSeen = true;
 
+    const heartbeatState = {
+      leaveBtn: !!leaveBtn,
+      meetingContainer: !!meetingContainer,
+      endedScreen: !!endedScreen,
+      meetingContainerEverSeen: meetingContainerEverSeen,
+      transcriptLength: transcript.length
+    };
+    const nextStateKey = [
+      heartbeatState.leaveBtn,
+      heartbeatState.meetingContainer,
+      heartbeatState.endedScreen,
+      heartbeatState.meetingContainerEverSeen
+    ].join('|');
+    if (window.__mtLastHeartbeatStateKey !== nextStateKey) {
+      window.__mtLastHeartbeatStateKey = nextStateKey;
+      mtLog('meeting-monitor:state-change', heartbeatState);
+    }
+
     if (meetingContainerEverSeen && ((!leaveBtn && !meetingContainer) || endedScreen)) {
-      console.log('Meet Transcriber: Meeting end detected. Saving and stopping.');
-      stopAndSave();
+      const reason = endedScreen ? 'meeting-ended-screen-detected' : 'meeting-ui-not-found';
+      mtWarn('meeting-monitor:stop-triggered', heartbeatState);
+      stopAndSave(reason);
     }
   }
 }, 3000);
 
 const captionObserver = new MutationObserver((mutations) => {
   if (!isRecording) return;
+
+  mtLog('mutation-observer:batch', { mutationCount: mutations.length });
 
   const captionConfig = getCaptionConfig();
 
@@ -810,11 +942,17 @@ const captionObserver = new MutationObserver((mutations) => {
     if (textEl || PLATFORM === 'zoom') {
       // Use textContent (not innerText) so hidden/off-screen caption elements are still read.
       let speechText = textEl ? textEl.textContent.trim() : blockContainer.textContent.trim();
-      if (!speechText) continue;
+      if (!speechText) {
+        mtWarn('mutation-observer:skip-empty-text');
+        continue;
+      }
 
       if (PLATFORM === 'zoom') {
         speechText = sanitizeZoomSpeechText(speechText);
-        if (!speechText) continue;
+        if (!speechText) {
+          mtWarn('mutation-observer:zoom-sanitize-empty');
+          continue;
+        }
       }
 
       let speakerName = nameEl ? nameEl.textContent.trim() : "";
@@ -830,7 +968,10 @@ const captionObserver = new MutationObserver((mutations) => {
       }
 
       speechText = sanitizeSpeechText(speakerName, speechText);
-      if (!speechText) continue;
+      if (!speechText) {
+        mtWarn('mutation-observer:skip-sanitized-empty');
+        continue;
+      }
 
       // Track by a unique ID assigned to the DOM container
       let blockId = blockContainer.getAttribute('data-transcript-id');
@@ -843,10 +984,21 @@ const captionObserver = new MutationObserver((mutations) => {
       if (existingEntry) {
         if (existingEntry.text !== speechText) {
           existingEntry.text = speechText;
+          mtLog('mutation-observer:update-entry', {
+            blockId: blockId,
+            speakerName: speakerName,
+            textLength: speechText.length
+          });
           saveTranscript();
         }
       } else {
         transcript.push({ id: blockId, name: speakerName, text: speechText });
+        mtLog('mutation-observer:new-entry', {
+          blockId: blockId,
+          speakerName: speakerName,
+          textLength: speechText.length,
+          transcriptLength: transcript.length
+        });
         saveTranscript();
       }
     }
@@ -856,7 +1008,11 @@ const captionObserver = new MutationObserver((mutations) => {
 let observedCaptionRoot = null;
 function ensureCaptionObserverAttached() {
   const nextRoot = getCaptionObservationRoot();
-  if (!nextRoot || observedCaptionRoot === nextRoot) return;
+  if (!nextRoot) {
+    mtWarn('caption-observer:skip-no-root');
+    return;
+  }
+  if (observedCaptionRoot === nextRoot) return;
 
   captionObserver.disconnect();
   captionObserver.observe(nextRoot, {
@@ -867,6 +1023,11 @@ function ensureCaptionObserverAttached() {
     attributeFilter: ['class', 'style', 'aria-hidden', 'data-is-muted']
   });
   observedCaptionRoot = nextRoot;
+  mtLog('caption-observer:attached', {
+    rootTag: nextRoot.tagName,
+    rootId: nextRoot.id || '',
+    rootClass: nextRoot.className || ''
+  });
 }
 
 ensureCaptionObserverAttached();
@@ -910,9 +1071,15 @@ if (PLATFORM === 'zoom') {
 
       const existing = transcript.find(e => e.id === elId);
       if (existing) {
-        if (existing.text !== text) { existing.text = text; existing.name = speakerName; saveTranscript(); }
+        if (existing.text !== text) {
+          existing.text = text;
+          existing.name = speakerName;
+          mtLog('zoom-aria-live:update-entry', { id: elId, speakerName: speakerName, textLength: text.length });
+          saveTranscript();
+        }
       } else {
         transcript.push({ id: elId, name: speakerName, text });
+        mtLog('zoom-aria-live:new-entry', { id: elId, speakerName: speakerName, textLength: text.length });
         saveTranscript();
       }
     });
@@ -931,14 +1098,28 @@ if (PLATFORM === 'meet') {
     const { deviceId, deviceName } = evt.detail || {};
     if (deviceId && deviceName) {
       meetDeviceMap[deviceId] = deviceName;
+      mtLog('meet-device-map:update', {
+        deviceId: deviceId,
+        deviceName: deviceName,
+        totalKnownDevices: Object.keys(meetDeviceMap).length
+      });
       debugDevLog('meet-device', `${deviceId} → ${deviceName}`);
+    } else {
+      mtWarn('meet-device-map:skip-invalid-event', evt.detail || {});
     }
   });
 
   document.addEventListener('__mt_meet_caption', (evt) => {
     if (!isRecording) return;
     const { deviceId, messageId, messageVersion, text } = evt.detail || {};
-    if (!text || !messageId) return;
+    if (!text || !messageId) {
+      mtWarn('meet-caption:skip-missing-required', {
+        hasText: !!text,
+        hasMessageId: !!messageId,
+        deviceId: deviceId
+      });
+      return;
+    }
 
     // Resolve display name from the device map (populated before first caption arrives)
     let speakerName = meetDeviceMap[deviceId] || '';
@@ -957,10 +1138,23 @@ if (PLATFORM === 'meet') {
         existing.text = cleanText;
         existing.name = speakerName;
         existing._rtcVersion = messageVersion;
+        mtLog('meet-caption:update-entry', {
+          messageId: messageId,
+          messageVersion: messageVersion,
+          speakerName: speakerName,
+          textLength: cleanText.length
+        });
         saveTranscript();
       }
     } else {
       transcript.push({ id: messageId, name: speakerName, text: cleanText, _rtcVersion: messageVersion });
+      mtLog('meet-caption:new-entry', {
+        messageId: messageId,
+        messageVersion: messageVersion,
+        speakerName: speakerName,
+        textLength: cleanText.length,
+        transcriptLength: transcript.length
+      });
       saveTranscript();
     }
   });
@@ -979,19 +1173,39 @@ if (PLATFORM === 'teams') {
     const domPanelActive = !!document.querySelector(
       '[data-tid="closed-captions-v2-items-renderer"], [data-tid="closed-caption-renderer-wrapper"]'
     );
-    if (domPanelActive) return;
+    if (domPanelActive) {
+      mtLog('teams-caption:fallback-skip-dom-panel-active');
+      return;
+    }
 
     const { userId, text, messageId } = evt.detail || {};
-    if (!text || !messageId) return;
+    if (!text || !messageId) {
+      mtWarn('teams-caption:skip-missing-required', {
+        hasText: !!text,
+        hasMessageId: !!messageId,
+        userId: userId
+      });
+      return;
+    }
 
     // Deduplicate by messageId
-    if (transcript.find(e => e.id === messageId)) return;
+    if (transcript.find(e => e.id === messageId)) {
+      mtLog('teams-caption:skip-duplicate', { messageId: messageId });
+      return;
+    }
 
     // Try to resolve speaker name from Teams participant tiles.
     // Teams often stores the MRI in data-mri / data-user-id on roster elements.
     let speakerName = resolveTeamsSpeakerFromDom(userId);
 
     transcript.push({ id: messageId, name: speakerName, text });
+    mtLog('teams-caption:new-entry', {
+      messageId: messageId,
+      userId: userId,
+      speakerName: speakerName,
+      textLength: text.length,
+      transcriptLength: transcript.length
+    });
     saveTranscript();
   });
 }
@@ -1006,27 +1220,36 @@ function resolveTeamsSpeakerFromDom(userId) {
 
   // Teams video gallery tiles and roster entries sometimes carry data-mri
   const candidates = document.querySelectorAll('[data-mri], [data-user-id]');
+  mtLog('resolveTeamsSpeakerFromDom:start', { userId: userId, candidates: candidates.length });
   for (const el of candidates) {
     const mri = el.getAttribute('data-mri') || el.getAttribute('data-user-id') || '';
     if (mri && userId.includes(mri) || mri.includes(userId)) {
       const nameEl = el.querySelector('[class*="name" i], [data-tid*="name" i]') || el;
       const name = (nameEl.textContent || '').trim();
-      if (name && name.length > 1 && name.length < 80) return name;
+      if (name && name.length > 1 && name.length < 80) {
+        mtLog('resolveTeamsSpeakerFromDom:resolved', { userId: userId, mri: mri, speakerName: name });
+        return name;
+      }
     }
   }
 
   // Last-resort: show a shortened form of the userId so the user can tell
   // speakers apart even without resolved names.
   const shortId = userId.split(':').pop() || userId;
-  return 'Speaker (' + shortId.slice(-6) + ')';
+  const fallbackName = 'Speaker (' + shortId.slice(-6) + ')';
+  mtWarn('resolveTeamsSpeakerFromDom:fallback', { userId: userId, fallbackName: fallbackName });
+  return fallbackName;
 }
 
 // ── Floating Widget (Shadow DOM) ────────────────────────────
 
 function injectWidget() {
   if (widgetHost && document.body.contains(widgetHost)) {
+    mtLog('widget-inject:skip-already-present');
     return;
   }
+
+  mtLog('widget-inject:start');
 
   const widgetTitle = PLATFORM === 'teams'
     ? '📝 Teams Transcriber'
@@ -1458,6 +1681,7 @@ function injectWidget() {
 
   // Sync UI immediately with current in-memory state (handles late injection).
   refreshUI();
+  mtLog('widget-inject:complete');
 }
 
 function escapeHTML(str) {
@@ -1468,17 +1692,22 @@ function escapeHTML(str) {
 
 function refreshUI() {
   if (typeof window.__meetTranscriberRefreshUI === 'function') {
+    mtLog('refreshUI:invoke');
     window.__meetTranscriberRefreshUI();
+  } else {
+    mtWarn('refreshUI:skip-no-widget-hook');
   }
 }
 
 // Inject the widget once the page is ready
 if (document.readyState === 'loading') {
   document.addEventListener('DOMContentLoaded', () => {
+    mtLog('dom-ready:DOMContentLoaded');
     ensureWidgetState();
     ensureCaptionObserverAttached();
   });
 } else {
+  mtLog('dom-ready:already-ready', { readyState: document.readyState });
   ensureWidgetState();
   ensureCaptionObserverAttached();
 }
@@ -1486,6 +1715,7 @@ if (document.readyState === 'loading') {
 window.addEventListener('popstate', ensureWidgetState);
 window.addEventListener('hashchange', ensureWidgetState);
 setInterval(() => {
+  mtLog('periodic-ui-check');
   ensureWidgetState();
   ensureCaptionObserverAttached();
 }, 2000);

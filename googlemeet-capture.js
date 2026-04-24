@@ -20,6 +20,32 @@
   if (window.__meetTranscriberGMeetCapture) return;
   window.__meetTranscriberGMeetCapture = true;
 
+  function log(step, details) {
+    if (details === undefined) {
+      console.log('[MeetTranscriber][meet-capture] ' + step);
+      return;
+    }
+    console.log('[MeetTranscriber][meet-capture] ' + step, details);
+  }
+
+  function warn(step, details) {
+    if (details === undefined) {
+      console.warn('[MeetTranscriber][meet-capture] ' + step);
+      return;
+    }
+    console.warn('[MeetTranscriber][meet-capture] ' + step, details);
+  }
+
+  function err(step, error) {
+    console.error('[MeetTranscriber][meet-capture] ' + step, error);
+  }
+
+  log('init', {
+    url: window.location.href,
+    hasRTC: !!window.RTCPeerConnection,
+    hasDecompressionStream: typeof DecompressionStream !== 'undefined'
+  });
+
   var SYNC_URL = 'https://meet.google.com/$rpc/google.rtc.meetings.v1.MeetingSpaceService/SyncMeetingSpaceCollections';
 
   // ── Minimal length-safe protobuf parser ──────────────────────
@@ -88,7 +114,10 @@
       data = data.slice(3);
     }
     if (!isGzip(data)) return Promise.resolve(data);
-    if (typeof DecompressionStream === 'undefined') return Promise.resolve(data);
+    if (typeof DecompressionStream === 'undefined') {
+      warn('decompress-skipped:no-DecompressionStream');
+      return Promise.resolve(data);
+    }
     try {
       var ds = new DecompressionStream('gzip');
       var w = ds.writable.getWriter();
@@ -108,8 +137,14 @@
           return pump();
         });
       }
-      return pump().catch(function () { return u8; });
-    } catch (e) { return Promise.resolve(u8); }
+      return pump().catch(function (e) {
+        warn('decompress-failed:reader', e && e.message ? e.message : e);
+        return u8;
+      });
+    } catch (e) {
+      warn('decompress-failed:exception', e && e.message ? e.message : e);
+      return Promise.resolve(u8);
+    }
   }
 
   function toU8(raw) {
@@ -142,14 +177,26 @@
       var text          = msg[6] && msg[6][0] ? str(msg[6][0].v) : '';
       var langId        = msg[8] && msg[8][0] ? msg[8][0].v : 0;
       // Require all semantic fields to be present and non-zero
-      if (!deviceId || !messageId || !messageVer || !text) return null;
+      if (!deviceId || !messageId || !messageVer || !text) {
+        warn('caption-decode-skip:missing-required', {
+          hasDeviceId: !!deviceId,
+          messageId: messageId,
+          messageVersion: messageVer,
+          textLength: text ? text.length : 0,
+          langId: langId
+        });
+        return null;
+      }
       return {
         deviceId:       '@' + deviceId,
         messageId:      messageId + '/@' + deviceId,
         messageVersion: messageVer,
         text:           text
       };
-    } catch (e) { return null; }
+    } catch (e) {
+      warn('caption-decode-error', e && e.message ? e.message : e);
+      return null;
+    }
   }
 
   // ── BDevice decoder (from collections data channel) ──────────
@@ -170,9 +217,18 @@
       d = parseFields(d[2][0].v);
       var deviceId   = d[1] && d[1][0] ? str(d[1][0].v) : '';
       var deviceName = d[2] && d[2][0] ? str(d[2][0].v) : '';
-      if (!deviceId || !deviceName) return null;
+      if (!deviceId || !deviceName) {
+        warn('device-decode-skip:missing-required', {
+          hasDeviceId: !!deviceId,
+          hasDeviceName: !!deviceName
+        });
+        return null;
+      }
       return { deviceId: '@' + deviceId, deviceName: deviceName };
-    } catch (e) { return null; }
+    } catch (e) {
+      warn('device-decode-error', e && e.message ? e.message : e);
+      return null;
+    }
   }
 
   // ── BMeetingCollection decoder (from SyncMeetingSpaceCollections HTTP) ─
@@ -193,10 +249,14 @@
           deviceName: str(sub[2] && sub[2][0] ? sub[2][0].v : new Uint8Array())
         };
       }).filter(function (p) { return p.deviceId !== '@' && p.deviceName; });
-    } catch (e) { return []; }
+    } catch (e) {
+      warn('participant-list-decode-error', e && e.message ? e.message : e);
+      return [];
+    }
   }
 
   function dispatchDevice(info) {
+    log('dispatch-device', info);
     document.dispatchEvent(new CustomEvent('__mt_meet_device', { detail: info }));
   }
 
@@ -212,60 +272,139 @@
   // (exactly like Tactiq), attach ondatachannel listener to every instance,
   // and when 'collections' arrives create 'captions' ourselves.
   var OrigRTC = window.RTCPeerConnection;
-  if (!OrigRTC) return;
+  if (!OrigRTC) {
+    warn('init-abort:no-RTCPeerConnection');
+    return;
+  }
 
   var origCreateDC = OrigRTC.prototype.createDataChannel;
 
   function attachCaptionsChannel(pc) {
     try {
+      log('captions-create:start');
       var ch = origCreateDC.call(pc, 'captions', { ordered: true, maxRetransmits: 10 });
+      log('captions-create:ok', { readyState: ch.readyState });
+
+      ch.addEventListener('open', function () {
+        log('captions-channel-open', { readyState: ch.readyState });
+      });
+
+      ch.addEventListener('close', function () {
+        warn('captions-channel-close', { readyState: ch.readyState });
+      });
+
+      ch.addEventListener('error', function (evt) {
+        err('captions-channel-error', evt && evt.error ? evt.error : evt);
+      });
+
       // Listen for caption messages on this channel
       ch.addEventListener('message', function (evt) {
         var u8 = toU8(evt.data);
-        if (!u8 || typeof evt.data === 'string') return;
+        if (!u8 || typeof evt.data === 'string') {
+          warn('captions-message-skip:non-binary', {
+            type: typeof evt.data
+          });
+          return;
+        }
         decompress(u8).then(function (data) {
           var msg = decodeCaptionFrame(data);
           if (msg) {
+            log('captions-message:decoded', {
+              deviceId: msg.deviceId,
+              messageId: msg.messageId,
+              version: msg.messageVersion,
+              textLength: msg.text.length
+            });
             document.dispatchEvent(new CustomEvent('__mt_meet_caption', { detail: msg }));
+          } else {
+            warn('captions-message-skip:decode-null', { bytes: data.length });
           }
+        }).catch(function (e) {
+          err('captions-message:decompress-promise-error', e);
         });
       });
-    } catch (e) { /* pc may already be closed */ }
+    } catch (e) {
+      err('captions-create-failed', e);
+    }
   }
 
   // Wrapper constructor — replaces window.RTCPeerConnection
   function WrapRTC(config, constraints) {
+    log('rtc-wrap:new-connection');
     var pc = new OrigRTC(config, constraints);
 
     // Server-created channels arrive here
     pc.addEventListener('datachannel', function (evt) {
       var ch = evt.channel;
+      log('rtc-datachannel', { label: ch && ch.label, readyState: ch && ch.readyState });
 
       if (ch.label === 'collections') {
+        log('collections-channel-detected');
         // 'collections' channel carries participant deviceId → name maps
         ch.addEventListener('message', function (evt2) {
           var u8 = toU8(evt2.data);
-          if (!u8 || typeof evt2.data === 'string') return;
+          if (!u8 || typeof evt2.data === 'string') {
+            warn('collections-message-skip:non-binary', {
+              type: typeof evt2.data
+            });
+            return;
+          }
           decompress(u8).then(function (data) {
             var info = decodeDeviceFrame(data);
             if (info) dispatchDevice(info);
+            else warn('collections-message-skip:decode-null', { bytes: data.length });
+          }).catch(function (e) {
+            err('collections-message:decompress-promise-error', e);
           });
         });
+
+        ch.addEventListener('close', function () {
+          warn('collections-channel-close', { readyState: ch.readyState });
+        });
+
+        ch.addEventListener('error', function (evt2) {
+          err('collections-channel-error', evt2 && evt2.error ? evt2.error : evt2);
+        });
+
         // SCTP transport is up — create the captions channel now
         attachCaptionsChannel(pc);
       }
 
       // Also handle 'meet_messages' (alternative caption channel on some versions)
       if (ch.label === 'meet_messages') {
+        log('meet_messages-channel-detected');
         ch.addEventListener('message', function (evt2) {
           var u8 = toU8(evt2.data);
-          if (!u8 || typeof evt2.data === 'string') return;
+          if (!u8 || typeof evt2.data === 'string') {
+            warn('meet_messages-skip:non-binary', {
+              type: typeof evt2.data
+            });
+            return;
+          }
           decompress(u8).then(function (data) {
             var msg = decodeCaptionFrame(data);
             if (msg) {
+              log('meet_messages:decoded', {
+                deviceId: msg.deviceId,
+                messageId: msg.messageId,
+                version: msg.messageVersion,
+                textLength: msg.text.length
+              });
               document.dispatchEvent(new CustomEvent('__mt_meet_caption', { detail: msg }));
+            } else {
+              warn('meet_messages-skip:decode-null', { bytes: data.length });
             }
+          }).catch(function (e) {
+            err('meet_messages:decompress-promise-error', e);
           });
+        });
+
+        ch.addEventListener('close', function () {
+          warn('meet_messages-channel-close', { readyState: ch.readyState });
+        });
+
+        ch.addEventListener('error', function (evt2) {
+          err('meet_messages-channel-error', evt2 && evt2.error ? evt2.error : evt2);
         });
       }
     });
@@ -277,6 +416,7 @@
   // Keep prototype chain intact so instanceof checks still work
   WrapRTC.prototype = OrigRTC.prototype;
   window.RTCPeerConnection = WrapRTC;
+  log('rtc-wrap:installed');
 
   // ── Fetch intercept for initial participant list ──────────────
   var origFetch = window.fetch;
@@ -286,16 +426,25 @@
     var urlStr = typeof req === 'string' ? req : (req instanceof Request ? req.url : String(req));
     var p = origFetch.apply(this, args);
     if (urlStr === SYNC_URL) {
+      log('fetch-sync-collections:hit');
       p.then(function (resp) {
         resp.clone().text().then(function (b64) {
           try {
             var u8 = Uint8Array.from(atob(b64), function (c) { return c.charCodeAt(0); });
-            decodeParticipantList(u8).forEach(dispatchDevice);
-          } catch (e) { /* not base64 or not a collection response */ }
+            var participants = decodeParticipantList(u8);
+            log('fetch-sync-collections:decoded', { count: participants.length });
+            participants.forEach(dispatchDevice);
+          } catch (e) {
+            warn('fetch-sync-collections:parse-failed', e && e.message ? e.message : e);
+          }
         }).catch(function () {});
-      }).catch(function () {});
+      }).catch(function (e) {
+        warn('fetch-sync-collections:request-failed', e && e.message ? e.message : e);
+      });
     }
     return p;
   };
+
+  log('init-complete');
 
 })();
