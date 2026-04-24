@@ -6,3 +6,6 @@ Desktop.ini
 # Chrome extension local data (if any)
 *.log
 *.tmp
+
+# Local reverse-engineering/reference snapshots
+references/

@@ -189,6 +189,7 @@ let autoRecordEnabled = true;  // record automatically on join; user can disable
 // seen at least once. Prevents false-positive stopAndSave() on initial page load
 // before the meeting UI finishes rendering (Teams SPA issue).
 let meetingContainerEverSeen = false;
+let meetingUiMissingStreak = 0;
 
 // Extract meeting code from URL
 function getMeetingCode() {
@@ -889,6 +890,7 @@ setInterval(() => {
       leaveBtn: !!leaveBtn,
       meetingContainer: !!meetingContainer,
       endedScreen: !!endedScreen,
+      uiMissingStreak: meetingUiMissingStreak,
       meetingContainerEverSeen: meetingContainerEverSeen,
       transcriptLength: transcript.length
     };
@@ -903,10 +905,33 @@ setInterval(() => {
       mtLog('meeting-monitor:state-change', heartbeatState);
     }
 
-    if (meetingContainerEverSeen && ((!leaveBtn && !meetingContainer) || endedScreen)) {
-      const reason = endedScreen ? 'meeting-ended-screen-detected' : 'meeting-ui-not-found';
+    if (meetingContainerEverSeen && endedScreen) {
+      meetingUiMissingStreak = 0;
+      const reasonEnded = 'meeting-ended-screen-detected';
       mtWarn('meeting-monitor:stop-triggered', heartbeatState);
-      stopAndSave(reason);
+      stopAndSave(reasonEnded);
+      return;
+    }
+
+    if (meetingContainerEverSeen && !leaveBtn && !meetingContainer) {
+      meetingUiMissingStreak += 1;
+      mtWarn('meeting-monitor:ui-missing-tick', {
+        streak: meetingUiMissingStreak,
+        leaveBtn: !!leaveBtn,
+        meetingContainer: !!meetingContainer
+      });
+      // Require several consecutive misses to avoid false stops caused by
+      // short Meet UI rerenders / route transitions.
+      if (meetingUiMissingStreak >= 4) {
+        const reasonMissing = 'meeting-ui-not-found-consecutive';
+        mtWarn('meeting-monitor:stop-triggered', heartbeatState);
+        stopAndSave(reasonMissing);
+      }
+    } else {
+      if (meetingUiMissingStreak > 0) {
+        mtLog('meeting-monitor:ui-missing-streak-reset', { previousStreak: meetingUiMissingStreak });
+      }
+      meetingUiMissingStreak = 0;
     }
   }
 }, 3000);
@@ -1185,12 +1210,16 @@ function injectMeetCaptionHideStyle() {
   // still fires), display/visibility changes can sometimes affect Meet's
   // internal state so we deliberately avoid them.
   style.textContent = `
+    [aria-live="polite"] [jsname="W297wb"],
+    [aria-live="assertive"] [jsname="W297wb"],
     div[jsname="W297wb"],
     .iY996, .V006ub, .nS7Zeb,
     .nMcdL, [jsname="YSZ4cc"], [jsname="Vpvi7b"],
     [jsname="dsyhDe"], .a4cQT > [jsname] > [class*="caption" i] {
       opacity: 0 !important;
+      visibility: hidden !important;
       pointer-events: none !important;
+      user-select: none !important;
     }
   `;
   document.head.appendChild(style);
@@ -1224,21 +1253,18 @@ if (PLATFORM === 'meet') {
     );
     if (!inMeeting) return;
 
+    // Keep hide style continuously active during recording to avoid visible
+    // flashes while Meet mounts/remounts caption nodes.
+    injectMeetCaptionHideStyle();
+
     // If caption panel elements are present, captions are already on.
     const captionConfig = getCaptionConfig();
     const captionsPresent = !!document.querySelector(captionConfig.container);
 
     if (captionsPresent) {
       captionKeeperWarned = false;
-      // Captions are on — inject the visual hide so the user doesn't see
-      // the native overlay. Idempotent: no-op if style already injected.
-      injectMeetCaptionHideStyle();
       return;
     }
-
-    // Caption panel is absent — remove stale hide style first (in case it
-    // was injected in a previous cycle), then click "Turn on captions".
-    removeMeetCaptionHideStyle();
 
     const ccBtn = document.querySelector(
       'button[aria-label*="Turn on captions" i], ' +

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Meet Transcriber",
-  "version": "1.2",
+  "version": "1.3",
   "description": "Records Google Meet closed captions and saves them to a text file.",
   "permissions": [
     "storage",
