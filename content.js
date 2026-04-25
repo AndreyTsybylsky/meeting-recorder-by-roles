@@ -170,7 +170,12 @@ function ensureWidgetState() {
 }
 
 function destroyWidget() {
-  mtLog('widget-destroy:start', { hadWidget: !!widgetHost });
+  mtLog('widget-destroy:start', { hadWidget: !!widgetHost, transcriptLength: transcript.length });
+  // Always save transcript before destroying widget to prevent data loss
+  if (transcript.length > 0) {
+    safeStorageSet({ [TRANSCRIPT_STORAGE_KEY]: transcript });
+    mtLog('widget-destroy:saved-transcript', { length: transcript.length });
+  }
   if (widgetHost && widgetHost.parentNode) {
     widgetHost.parentNode.removeChild(widgetHost);
   }
@@ -653,16 +658,15 @@ safeStorageGet([RECORDING_STORAGE_KEY, TRANSCRIPT_STORAGE_KEY, 'isRecording', 't
       tryEnableMeetCaptionsOnRecordingStart('auto-start');
     }
 
-    // Restore transcript only if we are resuming (not fresh auto-start).
-    if (!autoRecordEnabled || scopedIsRecording === true) {
-      if (Array.isArray(scopedTranscript)) {
-        transcript = scopedTranscript;
-        mtLog('storage-init:restored-scoped-transcript', { length: transcript.length });
-      } else if (Array.isArray(res.transcript)) {
-        transcript = res.transcript;
-        safeStorageSet({ [TRANSCRIPT_STORAGE_KEY]: transcript });
-        mtLog('storage-init:migrated-legacy-transcript', { length: transcript.length });
-      }
+    // Always restore transcript from storage, regardless of autoRecordEnabled status.
+    // This ensures the user's previous transcripts are never lost.
+    if (Array.isArray(scopedTranscript)) {
+      transcript = scopedTranscript;
+      mtLog('storage-init:restored-scoped-transcript', { length: transcript.length });
+    } else if (Array.isArray(res.transcript)) {
+      transcript = res.transcript;
+      safeStorageSet({ [TRANSCRIPT_STORAGE_KEY]: transcript });
+      mtLog('storage-init:migrated-legacy-transcript', { length: transcript.length });
     }
   }
 
