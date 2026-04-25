@@ -53,8 +53,38 @@
   // 1. CAPTION CONTAINER MONITORING (DOM-based)
   // ═════════════════════════════════════════════════════════════════
 
-  var lastCaptionText = '';
+  var lastCaptionTexts = {}; // Track multiple caption versions to avoid duplicates
   var captionMonitorActive = false;
+  var systemMessagePatterns = [
+    /turned on live transcription/i,
+    /turned off live transcription/i,
+    /started recording/i,
+    /stopped recording/i,
+    /has joined/i,
+    /has left/i,
+    /is now/i,
+    /changed.*name/i
+  ];
+
+  function isSystemMessage(text) {
+    if (!text) return false;
+    for (var i = 0; i < systemMessagePatterns.length; i++) {
+      if (systemMessagePatterns[i].test(text)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function normalizeText(text) {
+    // Normalize for comparison: lowercase, collapse whitespace
+    return (text || '').toLowerCase().replace(/\s+/g, ' ').trim();
+  }
+
+  function textSimilarity(a, b) {
+    // Simple similarity check: if normalized texts match, they're similar
+    return normalizeText(a) === normalizeText(b);
+  }
 
   function startCaptionMonitor() {
     if (captionMonitorActive) return;
@@ -72,44 +102,90 @@
       '[class*="subtitle-item"]'
     ];
 
-    function findCaptionElement() {
+    function findCaptionElements() {
+      var elements = [];
       for (var i = 0; i < captionSelectors.length; i++) {
-        var el = document.querySelector(captionSelectors[i]);
-        if (el && el.textContent && el.textContent.trim().length > 0) {
-          return el;
+        var selector = captionSelectors[i];
+        var nodeList = document.querySelectorAll(selector);
+        for (var j = 0; j < nodeList.length; j++) {
+          var el = nodeList[j];
+          if (el && el.textContent && el.textContent.trim().length > 0) {
+            elements.push(el);
+          }
         }
       }
-      return null;
+      return elements;
     }
 
-    // Simple polling approach (Zoom doesn't use MutationObserver well for captions)
+    // Polling approach with deduplication
     var checkInterval = setInterval(function () {
       try {
-        var captionEl = findCaptionElement();
-        if (captionEl) {
+        var captionElements = findCaptionElements();
+        var seenTexts = {};
+
+        for (var i = 0; i < captionElements.length; i++) {
+          var captionEl = captionElements[i];
           var text = captionEl.textContent.trim();
           var speaker = extractSpeaker(captionEl);
 
-          if (text && text !== lastCaptionText) {
-            lastCaptionText = text;
-            dbg('caption:new-text', { speaker: speaker, text: text.substring(0, 50) + (text.length > 50 ? '...' : '') });
+          if (!text) continue;
 
-            document.dispatchEvent(new CustomEvent('__mt_zoom_caption', {
-              detail: {
-                speaker: speaker || 'Unknown Speaker',
-                text: text,
-                timestamp: Date.now()
-              }
-            }));
+          // Filter out system messages
+          if (isSystemMessage(text)) {
+            dbg('caption:skip-system-message', { text: text.substring(0, 50) });
+            continue;
           }
+
+          var normalizedText = normalizeText(text);
+          var compositeKey = speaker + '|' + normalizedText;
+
+          // Skip if we've already seen this exact speaker+text combo in this check cycle
+          if (seenTexts[compositeKey]) {
+            dbg('caption:skip-duplicate-in-cycle', { speaker: speaker, text: text.substring(0, 50) });
+            continue;
+          }
+          seenTexts[compositeKey] = true;
+
+          // Skip if we've recently seen this text (within last 2 seconds)
+          var lastSeen = lastCaptionTexts[compositeKey];
+          var timeSinceLastSeen = lastSeen ? Date.now() - lastSeen : Infinity;
+          if (timeSinceLastSeen < 2000) {
+            dbg('caption:skip-too-recent', { speaker: speaker, text: text.substring(0, 50), msSinceLastSeen: timeSinceLastSeen });
+            continue;
+          }
+
+          // This is a new/updated caption
+          lastCaptionTexts[compositeKey] = Date.now();
+          dbg('caption:new-text', { speaker: speaker, text: text.substring(0, 50) + (text.length > 50 ? '...' : '') });
+
+          document.dispatchEvent(new CustomEvent('__mt_zoom_caption', {
+            detail: {
+              speaker: speaker || 'Unknown Speaker',
+              text: text,
+              timestamp: Date.now()
+            }
+          }));
         }
       } catch (e) {
         err('caption-monitor:error', e && e.message);
       }
-    }, 500); // Check every 500ms
+    }, 800); // Check every 800ms (reduced frequency to catch fewer duplicates)
+
+    // Cleanup old entries from lastCaptionTexts periodically
+    var cleanupInterval = setInterval(function () {
+      var now = Date.now();
+      var keysToDelete = [];
+      for (var key in lastCaptionTexts) {
+        if (now - lastCaptionTexts[key] > 30000) { // Keep 30s history
+          keysToDelete.push(key);
+        }
+      }
+      keysToDelete.forEach(function (key) { delete lastCaptionTexts[key]; });
+    }, 10000);
 
     function cleanup() {
       clearInterval(checkInterval);
+      clearInterval(cleanupInterval);
       captionMonitorActive = false;
     }
 

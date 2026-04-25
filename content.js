@@ -1389,9 +1389,11 @@ if (PLATFORM === 'meet') {
 //
 // Zoom captions are parsed from DOM mutations rather than WebRTC channels.
 // The zoom-capture.js (MAIN world) monitors #live-transcription-subtitle
-// and dispatches __mt_zoom_caption events.
+// and dispatches __mt_zoom_caption events with deduplication.
 //
 if (PLATFORM === 'zoom') {
+  var zoomSeenCaptions = {}; // Track seen captions by normalized speaker+text to prevent duplicates
+
   document.addEventListener('__mt_zoom_caption', (evt) => {
     if (!isRecording) return;
     const { speaker, text, timestamp } = evt.detail || {};
@@ -1407,8 +1409,27 @@ if (PLATFORM === 'zoom') {
     const cleanText = sanitizeSpeechText(speaker, text.trim());
     if (!cleanText) return;
 
-    // Use speaker + timestamp as composite ID (Zoom doesn't have messageId)
-    const entryId = `zoom-${speaker}-${timestamp}`;
+    // Create normalized key for deduplication
+    const normalizedKey = (speaker + '|' + cleanText).toLowerCase();
+    const lastSeenTime = zoomSeenCaptions[normalizedKey];
+    const now = Date.now();
+
+    // Skip if we've seen this exact speaker+text within the last 3 seconds
+    if (lastSeenTime && now - lastSeenTime < 3000) {
+      mtLog('zoom-caption:skip-recent-duplicate', {
+        speaker: speaker,
+        textPreview: cleanText.substring(0, 40),
+        msSinceLastSeen: now - lastSeenTime
+      });
+      return;
+    }
+
+    // Update last seen time for this caption
+    zoomSeenCaptions[normalizedKey] = now;
+
+    // Use speaker + normalized text as ID (more stable than timestamp)
+    const textHash = Math.abs(normalizedKey.split('').reduce((a, c) => a * 31 + c.charCodeAt(0), 0)).toString(36);
+    const entryId = `zoom-${textHash}`;
     const existing = transcript.find(e => e.id === entryId);
 
     if (!existing) {
@@ -1425,6 +1446,12 @@ if (PLATFORM === 'zoom') {
         transcriptLength: transcript.length
       });
       saveTranscript();
+    } else {
+      mtLog('zoom-caption:duplicate-entry-ignored', {
+        speaker: speaker,
+        textPreview: cleanText.substring(0, 40),
+        entryId: entryId
+      });
     }
   });
 
