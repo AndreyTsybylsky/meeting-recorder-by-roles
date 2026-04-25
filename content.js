@@ -1452,8 +1452,12 @@ function ensureMeetCaptionsEnabled() {
   if (!btn || isMeetCaptionsEnabled(btn) !== false) return;
   suppressNextMeetCaptionToggleClick = true;
   meetCaptionEnabledByBootstrap = true;
-  btn.click();
-  setTimeout(() => { suppressNextMeetCaptionToggleClick = false; }, 800);
+  try {
+    // button.click() dispatches synchronously; release guard immediately after.
+    btn.click();
+  } finally {
+    suppressNextMeetCaptionToggleClick = false;
+  }
   mtLog('caption-keeper:ensure-enabled:clicked');
 }
 
@@ -1519,10 +1523,12 @@ function tryEnableMeetCaptionsOnRecordingStart(trigger) {
     if (captionsEnabled === false) {
       meetCaptionEnabledByBootstrap = true;
       suppressNextMeetCaptionToggleClick = true;
-      ccBtn.click();
-      setTimeout(() => {
+      try {
+        // Same as above: keep the bypass window only for this sync click.
+        ccBtn.click();
+      } finally {
         suppressNextMeetCaptionToggleClick = false;
-      }, 800);
+      }
       finish('clicked-enable', {
         btnLabel: ccBtn.getAttribute('aria-label') || '',
         btnJsname: ccBtn.getAttribute('jsname') || '',
