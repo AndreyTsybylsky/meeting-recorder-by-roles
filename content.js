@@ -646,6 +646,7 @@ safeStorageGet([RECORDING_STORAGE_KEY, TRANSCRIPT_STORAGE_KEY, 'isRecording', 't
       meetCaptionManualVisible = false;
       meetCaptionEnabledByBootstrap = false;
       meetCaptionBootstrapAttemptedForSession = false;
+      clearMeetCaptionBootstrapTimer();
       ensureCaptionObserverAttached();
       setScopedRecordingState(true, []);
       mtLog('storage-init:auto-start-enabled', { sessionId: currentSessionId });
@@ -732,6 +733,7 @@ if (isExtensionContextAvailable()) {
           meetCaptionManualVisible = false;
           meetCaptionEnabledByBootstrap = false;
           meetCaptionBootstrapAttemptedForSession = false;
+          clearMeetCaptionBootstrapTimer();
           ensureCaptionObserverAttached();
           setScopedRecordingState(true, []);
           mtLog('recording-start:manual-toggle', { sessionId: currentSessionId });
@@ -746,8 +748,12 @@ if (isExtensionContextAvailable()) {
           transcript = [];
           meetCaptionManualVisible = false;
           meetCaptionEnabledByBootstrap = false;
-          clearMeetCaptionBootstrapTimer();
           meetCaptionBootstrapAttemptedForSession = false;
+          clearMeetCaptionBootstrapTimer();
+          if (PLATFORM === 'meet') {
+            removeMeetCaptionHideStyle();
+            window.dispatchEvent(new Event('resize'));
+          }
           setScopedRecordingState(false, []);
           currentSessionId = null;
         }
@@ -876,7 +882,11 @@ function stopAndSave(reason) {
   isRecording = false;
   setScopedRecordingState(false, []);
   currentSessionId = null;
-  if (PLATFORM === 'meet') removeMeetCaptionHideStyle();
+  clearMeetCaptionBootstrapTimer();
+  if (PLATFORM === 'meet') {
+    removeMeetCaptionHideStyle();
+    window.dispatchEvent(new Event('resize'));
+  }
   mtWarn('stopAndSave:recording-stopped', { reason: reason || 'unspecified' });
   refreshUI();
 }
@@ -1031,7 +1041,8 @@ const captionObserver = new MutationObserver((mutations) => {
       let speakerName = nameEl ? nameEl.textContent.trim() : "";
       
       // Resolve "You/Вы" or missing names to real name
-      if (!speakerName || speakerName === "Вы" || speakerName === "You" || !isRealName(speakerName)) {
+      const isUnresolvedSelf = !speakerName || speakerName === "Вы" || speakerName === "You" || !isRealName(speakerName);
+      if (isUnresolvedSelf) {
         const discoveredName = PLATFORM === 'zoom' ? getZoomActiveSpeakerName() : getUserRealName();
         if (discoveredName) {
           speakerName = discoveredName;
@@ -1065,7 +1076,7 @@ const captionObserver = new MutationObserver((mutations) => {
           saveTranscript();
         }
       } else {
-        transcript.push({ id: blockId, name: speakerName, text: speechText });
+        transcript.push({ id: blockId, name: speakerName, text: speechText, _selfUnresolved: isUnresolvedSelf && !getUserRealName() });
         mtLog('mutation-observer:new-entry', {
           blockId: blockId,
           speakerName: speakerName,
@@ -1073,6 +1084,31 @@ const captionObserver = new MutationObserver((mutations) => {
           transcriptLength: transcript.length
         });
         saveTranscript();
+
+        // Retry resolving "Вы"/"You" → real name if it wasn't available yet
+        if (isUnresolvedSelf && speakerName !== getUserRealName()) {
+          const retryDelays = [800, 2500];
+          retryDelays.forEach(delay => {
+            setTimeout(() => {
+              const resolved = PLATFORM === 'zoom' ? getZoomActiveSpeakerName() : getUserRealName();
+              if (!resolved) return;
+              // Backfill ALL unresolved self-entries recorded so far
+              let patched = 0;
+              transcript.forEach(e => {
+                if (e._selfUnresolved && e.name !== resolved) {
+                  e.name = resolved;
+                  e._selfUnresolved = false;
+                  patched++;
+                }
+              });
+              if (patched > 0) {
+                mtLog('mutation-observer:retry-resolved-name-backfill', { resolved, patched });
+                saveTranscript();
+                refreshUI();
+              }
+            }, delay);
+          });
+        }
       }
     }
   }
@@ -1323,32 +1359,25 @@ if (PLATFORM === 'meet') {
 //   recovery events below, not by forcing the captions UI state.
 //
 const MEET_CAPTION_HIDE_STYLE_ID = '__mt-caption-hide';
+const MEET_CAPTION_LABEL_HINTS = [
+  'caption', 'subtit', 'субтит', 'титр', 'napis', 'legenda', 'untertitel', 'sous-titre', '字幕'
+];
 
 function injectMeetCaptionHideStyle() {
   if (document.getElementById(MEET_CAPTION_HIDE_STYLE_ID)) return;
   const style = document.createElement('style');
   style.id = MEET_CAPTION_HIDE_STYLE_ID;
-  // Target only nodes rendered inside Meet's aria-live caption overlays.
-  // This avoids broad class selectors that can hide unrelated/new containers
-  // when Meet changes internal DOM structure.
-  // opacity:0 keeps the elements in the layout tree (MutationObserver
-  // still fires), display/visibility changes can sometimes affect Meet's
-  // internal state so we deliberately avoid them.
-  style.textContent = `
-    [aria-live="polite"] [jsname="W297wb"],
-    [aria-live="assertive"] [jsname="W297wb"],
-    [aria-live="polite"] .nMcdL,
-    [aria-live="assertive"] .nMcdL,
-    [aria-live="polite"] [jsname="YSZ4cc"],
-    [aria-live="assertive"] [jsname="YSZ4cc"],
-    [aria-live="polite"] [jsname="Vpvi7b"],
-    [aria-live="assertive"] [jsname="Vpvi7b"] {
-      opacity: 0 !important;
-      visibility: hidden !important;
-      pointer-events: none !important;
-      user-select: none !important;
-    }
-  `;
+  // Hide the entire captions bar (.a4cQT) so it collapses completely.
+  // display:none is safe — MutationObserver fires regardless of CSS display,
+  // and RTC capture runs in the MAIN world so CSS cannot affect it.
+  // Inner selectors are belt-and-braces for Meet builds that render the bar
+  // outside .a4cQT.
+  style.textContent =
+    ".a4cQT," +
+    "div[jsname='dsyhDe'],div[jsname='dqMPrb']," +
+    "div[jsname='W297wb'],.nMcdL,[jsname='YSZ4cc'],[jsname='Vpvi7b']," +
+    "div:has(>div[jsname='dsyhDe']),div:has(>div[jsname='dqMPrb'])" +
+    "{display:none!important}";
   document.head.appendChild(style);
   mtLog('caption-keeper:hide-style-injected');
 }
@@ -1361,14 +1390,33 @@ function removeMeetCaptionHideStyle() {
   }
 }
 
-function getMeetCaptionsToggleButton() {
-  return document.querySelector(
-    'button[jsname="r8qRAd"], ' +
-    'button[aria-label*="captions" i], ' +
-    'button[aria-label*="субтитр" i], ' +
-    'button[aria-label*="napis" i], ' +
-    'button[aria-label*="字幕" i]'
+function normalizeMeetLabel(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function getMeetControlLabel(el) {
+  if (!el) return '';
+  return normalizeMeetLabel(
+    el.getAttribute('aria-label') ||
+    el.getAttribute('data-tooltip') ||
+    el.getAttribute('title') ||
+    el.textContent ||
+    ''
   );
+}
+
+function isMeetCaptionsToggleCandidate(el) {
+  const label = getMeetControlLabel(el);
+  if (!label) return false;
+  return MEET_CAPTION_LABEL_HINTS.some(token => label.includes(token));
+}
+
+function getMeetCaptionsToggleButton() {
+  const controls = document.querySelectorAll('button, [role="button"]');
+  for (const el of controls) {
+    if (isMeetCaptionsToggleCandidate(el)) return el;
+  }
+  return null;
 }
 
 function isMeetCaptionsEnabled(btn) {
@@ -1377,8 +1425,12 @@ function isMeetCaptionsEnabled(btn) {
   if (ariaPressed === 'true') return true;
   if (ariaPressed === 'false') return false;
 
-  const label = (btn.getAttribute('aria-label') || '').toLowerCase();
+  const label = getMeetControlLabel(btn);
   if (!label) return null;
+
+  // When captions bar is CSS-hidden, Meet's label can become unreliable
+  // (often always "Show captions"). Avoid false toggles from label-only state.
+  if (document.getElementById(MEET_CAPTION_HIDE_STYLE_ID)) return null;
 
   // "turn on/show" => currently off, "turn off/hide" => currently on.
   if (/turn on captions|enable captions|show captions|включить .*субтитр|показать .*субтитр|włącz napisy|字幕をオン/.test(label)) return false;
@@ -1388,10 +1440,21 @@ function isMeetCaptionsEnabled(btn) {
 }
 
 function clearMeetCaptionBootstrapTimer() {
-  if (meetCaptionBootstrapTimer) {
-    clearInterval(meetCaptionBootstrapTimer);
-    meetCaptionBootstrapTimer = null;
-  }
+  if (!meetCaptionBootstrapTimer) return;
+  clearInterval(meetCaptionBootstrapTimer);
+  meetCaptionBootstrapTimer = null;
+}
+
+// Re-enable server-side captions (e.g. after showing the bar, or after a drop).
+// Uses suppressNextMeetCaptionToggleClick so our click interceptor ignores it.
+function ensureMeetCaptionsEnabled() {
+  const btn = getMeetCaptionsToggleButton();
+  if (!btn || isMeetCaptionsEnabled(btn) !== false) return;
+  suppressNextMeetCaptionToggleClick = true;
+  meetCaptionEnabledByBootstrap = true;
+  btn.click();
+  setTimeout(() => { suppressNextMeetCaptionToggleClick = false; }, 800);
+  mtLog('caption-keeper:ensure-enabled:clicked');
 }
 
 function tryEnableMeetCaptionsOnRecordingStart(trigger) {
@@ -1406,13 +1469,26 @@ function tryEnableMeetCaptionsOnRecordingStart(trigger) {
   clearMeetCaptionBootstrapTimer();
 
   let attempts = 0;
-  const maxAttempts = 6;
+  const maxAttempts = 8;
+
+  function finish(status, detail) {
+    clearMeetCaptionBootstrapTimer();
+    if ((status === 'already-enabled' || status === 'clicked-enable') && meetCaptionOverlayHidden && !meetCaptionManualVisible) {
+      injectMeetCaptionHideStyle();
+      window.dispatchEvent(new Event('resize'));
+    }
+    mtLog('caption-bootstrap:' + status, {
+      trigger: trigger,
+      attempts: attempts,
+      ...(detail || {})
+    });
+  }
 
   meetCaptionBootstrapTimer = setInterval(() => {
     attempts += 1;
 
     if (!isRecording) {
-      clearMeetCaptionBootstrapTimer();
+      finish('stopped');
       return;
     }
 
@@ -1423,27 +1499,20 @@ function tryEnableMeetCaptionsOnRecordingStart(trigger) {
     );
 
     if (!inMeeting) {
-      if (attempts >= maxAttempts) {
-        mtWarn('caption-bootstrap:meeting-ui-not-ready', { trigger: trigger, attempts: attempts });
-        clearMeetCaptionBootstrapTimer();
-      }
+      if (attempts >= maxAttempts) finish('meeting-ui-not-ready');
       return;
     }
 
     const ccBtn = getMeetCaptionsToggleButton();
     if (!ccBtn) {
-      if (attempts >= maxAttempts) {
-        mtWarn('caption-bootstrap:button-not-found', { trigger: trigger, attempts: attempts });
-        clearMeetCaptionBootstrapTimer();
-      }
+      if (attempts >= maxAttempts) finish('button-not-found');
       return;
     }
 
     const captionsEnabled = isMeetCaptionsEnabled(ccBtn);
     if (captionsEnabled === true) {
       meetCaptionEnabledByBootstrap = false;
-      mtLog('caption-bootstrap:already-enabled', { trigger: trigger, attempts: attempts });
-      clearMeetCaptionBootstrapTimer();
+      finish('already-enabled');
       return;
     }
 
@@ -1454,27 +1523,20 @@ function tryEnableMeetCaptionsOnRecordingStart(trigger) {
       setTimeout(() => {
         suppressNextMeetCaptionToggleClick = false;
       }, 800);
-      mtLog('caption-bootstrap:clicked-enable-once', {
-        trigger: trigger,
-        attempts: attempts,
+      finish('clicked-enable', {
         btnLabel: ccBtn.getAttribute('aria-label') || '',
         btnJsname: ccBtn.getAttribute('jsname') || '',
         ariaPressed: ccBtn.getAttribute('aria-pressed')
       });
-      clearMeetCaptionBootstrapTimer();
       return;
     }
 
     if (attempts >= maxAttempts) {
-      // Ambiguous state in newer Meet can open settings popup; skip click.
-      mtWarn('caption-bootstrap:state-ambiguous-skip', {
-        trigger: trigger,
-        attempts: attempts,
+      finish('state-ambiguous-skip', {
         btnLabel: ccBtn.getAttribute('aria-label') || '',
         btnJsname: ccBtn.getAttribute('jsname') || '',
         ariaPressed: ccBtn.getAttribute('aria-pressed')
       });
-      clearMeetCaptionBootstrapTimer();
     }
   }, 1000);
 }
@@ -1490,47 +1552,32 @@ if (PLATFORM === 'meet') {
     const target = evt.target;
     if (!(target instanceof Element)) return;
 
-    const ccBtn = target.closest(
-      'button[jsname="r8qRAd"], ' +
-      'button[aria-label*="captions" i], ' +
-      'button[aria-label*="субтитр" i], ' +
-      'button[aria-label*="napis" i], ' +
-      'button[aria-label*="字幕" i]'
-    );
-    if (!ccBtn) return;
+    const ccBtn = target.closest('button, [role="button"]');
+    if (!ccBtn || !isMeetCaptionsToggleCandidate(ccBtn)) return;
     if (suppressNextMeetCaptionToggleClick) return;
 
-    const currentlyEnabled = isMeetCaptionsEnabled(ccBtn);
-
     if (meetCaptionOverlayHidden) {
-      // Captions overlay is in "hidden" mode — recording depends on Meet keeping
-      // captions ON at the server level. Block the click so Meet does NOT turn
-      // captions off (which would stop the DataChannel stream).
-      // Instead toggle only the CSS visual overlay.
+      // Captions overlay is in "hidden" mode. Intercept the click so Meet does NOT
+      // toggle server-side captions (which would stop the DataChannel stream).
+      // Use CSS presence — NOT the button label — as truth: when .a4cQT is
+      // display:none Meet always reports the button as "Show captions" regardless
+      // of actual server-side state, making label-based detection unreliable.
       evt.preventDefault();
       evt.stopImmediatePropagation();
 
-      if (currentlyEnabled === false) {
-        // Captions were off — this would have turned them ON.
-        // Let bootstrap handle it instead of passing the click through.
-        suppressNextMeetCaptionToggleClick = true;
-        meetCaptionEnabledByBootstrap = true;
-        ccBtn.click();
-        setTimeout(() => { suppressNextMeetCaptionToggleClick = false; }, 800);
-        meetCaptionManualVisible = false; // keep visual hidden
-        mtLog('caption-keeper:intercept-enable-kept-hidden');
-      } else {
-        // Captions were on — user tried to close them. Block it, just toggle visual.
-        meetCaptionEnabledByBootstrap = false;
-        meetCaptionManualVisible = !meetCaptionManualVisible;
-        mtLog('caption-keeper:intercept-close-blocked-toggle-visual', { nowVisible: meetCaptionManualVisible });
-      }
-
-      // Immediately apply the CSS change without waiting for the interval.
-      if (meetCaptionOverlayHidden && !meetCaptionManualVisible) {
-        injectMeetCaptionHideStyle();
-      } else {
+      if (document.getElementById(MEET_CAPTION_HIDE_STYLE_ID)) {
+        // Bar is currently hidden → user wants to show it.
         removeMeetCaptionHideStyle();
+        window.dispatchEvent(new Event('resize'));
+        ensureMeetCaptionsEnabled(); // re-confirm server-side captions are ON
+        meetCaptionManualVisible = true;
+        mtLog('caption-keeper:intercept-user-showed-bar');
+      } else {
+        // Bar is currently visible → user wants to hide it.
+        injectMeetCaptionHideStyle();
+        window.dispatchEvent(new Event('resize'));
+        meetCaptionManualVisible = false;
+        mtLog('caption-keeper:intercept-user-hid-bar');
       }
       return;
     }
@@ -1582,33 +1629,14 @@ if (PLATFORM === 'meet') {
       return;
     }
 
-    // Keep local state in sync even when user toggles captions via keyboard or
-    // Meet menus (paths where a direct CC button click event may not fire).
-    const ccBtn = getMeetCaptionsToggleButton();
-    const captionsEnabled = isMeetCaptionsEnabled(ccBtn);
-    if (captionsEnabled === false) {
-      meetCaptionManualVisible = false;
-      meetCaptionEnabledByBootstrap = false;
-    } else if (captionsEnabled === true && !meetCaptionEnabledByBootstrap && !meetCaptionManualVisible) {
-      meetCaptionManualVisible = true;
-      mtLog('caption-keeper:auto-detected-manual-visible-on');
-    } else if (captionsEnabled === null) {
-      // Button state is ambiguous (aria-pressed absent, aria-label in unrecognized locale, etc.).
-      // Fall back to DOM presence: Meet only renders caption overlay nodes when captions are ON.
-      const captionDomOpen = !!document.querySelector(
-        'div[jsname="W297wb"], .iY996, .V006ub, .nMcdL, [jsname="YSZ4cc"], [jsname="Vpvi7b"]'
-      );
-      if (captionDomOpen && !meetCaptionManualVisible && !meetCaptionEnabledByBootstrap) {
-        meetCaptionManualVisible = true;
-        mtLog('caption-keeper:dom-fallback-captions-open');
-      } else if (!captionDomOpen && meetCaptionManualVisible) {
-        meetCaptionManualVisible = false;
-        mtLog('caption-keeper:dom-fallback-captions-closed');
-      }
-    }
+    // Avoid race: while startup bootstrap is still deciding captions state,
+    // do not force CSS visibility changes from the periodic loop.
+    if (meetCaptionBootstrapTimer) return;
 
-    // Tactiq-like behavior: visual visibility is user-configurable and
-    // independent from capture/recovery logic.
+    // meetCaptionManualVisible is managed exclusively by the click interceptor.
+    // Do NOT re-derive it from button state here: when .a4cQT is display:none
+    // Meet always reports the button as "Show captions" regardless of server state,
+    // which would incorrectly override the user's explicit toggle choice.
     if (meetCaptionOverlayHidden && !meetCaptionManualVisible) {
       injectMeetCaptionHideStyle();
     } else {
@@ -1625,6 +1653,9 @@ if (PLATFORM === 'meet') {
       '[data-idom-class*="leave" i]'
     );
     if (!inMeeting) return;
+
+    // While bootstrap is in progress, let it own captions state.
+    if (meetCaptionBootstrapTimer) return;
 
     const now = Date.now();
     const inactivityMs = now - lastMeetCaptionActivityAt;
@@ -2193,15 +2224,25 @@ function injectWidget() {
     downloadBtn.disabled = transcript.length === 0;
     clearBtn.disabled = transcript.length === 0 && !isRecording;
 
-    // Transcript preview (show last 50 entries, reversed)
+    // Transcript preview (show last 50 entries, group consecutive same-speaker phrases)
     if (transcript.length === 0) {
       transcriptPreview.innerHTML = '<div class="transcript-empty">Нет записей</div>';
     } else {
       const last = transcript.slice(-50);
-      transcriptPreview.innerHTML = last.map(e =>
+      // Merge consecutive entries from the same speaker into one block
+      const grouped = [];
+      last.forEach(e => {
+        const prev = grouped[grouped.length - 1];
+        if (prev && prev.name === e.name) {
+          prev.texts.push(e.text);
+        } else {
+          grouped.push({ name: e.name, texts: [e.text] });
+        }
+      });
+      transcriptPreview.innerHTML = grouped.map(g =>
         `<div class="transcript-entry">
-          <div class="speaker">${escapeHTML(e.name)}</div>
-          <div class="text">${escapeHTML(e.text)}</div>
+          <div class="speaker">${escapeHTML(g.name)}</div>
+          ${g.texts.map(t => `<div class="text">${escapeHTML(t)}</div>`).join('')}
         </div>`
       ).join('');
       // Auto-scroll to bottom
