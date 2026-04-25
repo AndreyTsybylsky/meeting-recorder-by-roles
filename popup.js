@@ -80,12 +80,12 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
-  function resolveMeetingTabAndInitStrip() {
+  function resolveMeetingTab(callback) {
     // 1) Preferred: active tab in last focused browser window.
     chrome.tabs.query({ active: true, lastFocusedWindow: true }, (tabs) => {
       const activeTab = tabs && tabs[0];
       if (activeTab && isMeetingUrl(activeTab.url)) {
-        queryRecordingState(activeTab.id);
+        callback(activeTab.id);
         return;
       }
 
@@ -93,38 +93,62 @@ document.addEventListener('DOMContentLoaded', () => {
       chrome.tabs.query({ active: true, currentWindow: true }, (tabs2) => {
         const currentActive = tabs2 && tabs2[0];
         if (currentActive && isMeetingUrl(currentActive.url)) {
-          queryRecordingState(currentActive.id);
+          callback(currentActive.id);
           return;
         }
 
-        // 3) Last-resort fallback: find any open meeting tab and bind to it.
+        // 3) Last-resort fallback: find any open meeting tab.
         chrome.tabs.query({}, (allTabs) => {
           const meetingTab = (allTabs || []).find(t => isMeetingUrl(t.url));
-          if (meetingTab) {
-            queryRecordingState(meetingTab.id);
-            return;
-          }
-          activeMeetingTabId = null;
-          updateRecordStrip(false, false);
+          callback(meetingTab ? meetingTab.id : null);
         });
       });
+    });
+  }
+
+  function resolveMeetingTabAndInitStrip() {
+    resolveMeetingTab((tabId) => {
+      if (tabId === null) {
+        activeMeetingTabId = null;
+        updateRecordStrip(false, false);
+        return;
+      }
+      queryRecordingState(tabId);
     });
   }
 
   // Find meeting tab robustly (popup focus can make currentWindow unreliable).
   resolveMeetingTabAndInitStrip();
 
-  recordBtn.addEventListener('click', () => {
-    if (activeMeetingTabId === null) return;
-    recordBtn.disabled = true;
-    chrome.tabs.sendMessage(activeMeetingTabId, { type: 'TOGGLE_RECORDING' }, (response) => {
+  function sendToggleRecording(tabId, retriesLeft) {
+    chrome.tabs.sendMessage(tabId, { type: 'TOGGLE_RECORDING' }, (response) => {
       if (chrome.runtime.lastError || !response) {
+        if (retriesLeft > 0) {
+          // Brief retry helps when content script is still initializing.
+          setTimeout(() => sendToggleRecording(tabId, retriesLeft - 1), 300);
+          return;
+        }
         recordBtn.disabled = false;
+        queryRecordingState(tabId, 0);
         return;
       }
+
+      activeMeetingTabId = tabId;
       updateRecordStrip(response.isRecording, false);
       // Reload session list after stopping
       if (!response.isRecording) setTimeout(loadSessions, 600);
+    });
+  }
+
+  recordBtn.addEventListener('click', () => {
+    recordBtn.disabled = true;
+    resolveMeetingTab((tabId) => {
+      if (tabId === null) {
+        activeMeetingTabId = null;
+        updateRecordStrip(false, false);
+        return;
+      }
+      sendToggleRecording(tabId, 1);
     });
   });
   // ────────────────────────────────────────────────────────

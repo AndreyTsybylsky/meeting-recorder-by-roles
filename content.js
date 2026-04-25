@@ -2122,9 +2122,14 @@ function injectWidget() {
       // Start of a new session
       currentSessionId = Date.now().toString();
       // Clear transcript for a fresh start if it wasn't already cleared
-      transcript = []; 
+      transcript = [];
+      meetCaptionManualVisible = false;
+      meetCaptionEnabledByBootstrap = false;
+      meetCaptionBootstrapAttemptedForSession = false;
+      clearMeetCaptionBootstrapTimer();
       ensureCaptionObserverAttached();
       setScopedRecordingState(true, []);
+      tryEnableMeetCaptionsOnRecordingStart('widget-toggle');
       setPanelOpen(false);
       debugDevLog('record-start', `sessionId=${currentSessionId}`);
     } else {
@@ -2132,6 +2137,14 @@ function injectWidget() {
       finalizeSession();
       // We clear the active transcript after saving to history
       transcript = [];
+      meetCaptionManualVisible = false;
+      meetCaptionEnabledByBootstrap = false;
+      meetCaptionBootstrapAttemptedForSession = false;
+      clearMeetCaptionBootstrapTimer();
+      if (PLATFORM === 'meet') {
+        removeMeetCaptionHideStyle();
+        window.dispatchEvent(new Event('resize'));
+      }
       setScopedRecordingState(false, []);
       currentSessionId = null;
       debugDevLog('record-stop', 'recording stopped');
