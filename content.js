@@ -1036,6 +1036,13 @@ setInterval(() => {
 const captionObserver = new MutationObserver((mutations) => {
   if (!isRecording) return;
 
+  // Zoom has a dedicated MAIN-world capture module (zoom-capture.js).
+  // Skip generic DOM observer ingestion to avoid duplicate/conflicting updates
+  // that can overwrite already captured transcript lines.
+  if (PLATFORM === 'zoom' && window.__meetTranscriberZoomCaptureAPI) {
+    return;
+  }
+
   mtLog('mutation-observer:batch', { mutationCount: mutations.length });
 
   const captionConfig = getCaptionConfig();
@@ -1185,7 +1192,7 @@ ensureCaptionObserverAttached();
 // Zoom sometimes replaces entire subtitle DOM subtrees rather than mutating
 // text in place, which can cause MutationObserver to fire on the wrong level.
 // This scanner directly reads all aria-live regions every 600 ms as a safety net.
-if (PLATFORM === 'zoom') {
+if (PLATFORM === 'zoom' && !window.__meetTranscriberZoomCaptureAPI) {
   const zoomAriaLiveCache = new Map(); // element → last seen text
 
   setInterval(() => {
@@ -1431,7 +1438,47 @@ if (PLATFORM === 'zoom') {
     // Update last seen time for this caption
     zoomSeenCaptions[normalizedKey] = now;
 
-    // Use speaker + normalized text as ID (more stable than timestamp)
+    // Buzz-like "append and correct":
+    // 1) if new text is an extension of the latest speaker line, update last line
+    // 2) if new text is shorter regression, ignore it to avoid overwrite flicker
+    const lastEntry = transcript[transcript.length - 1];
+    if (
+      lastEntry &&
+      lastEntry._source === 'zoom-dom' &&
+      lastEntry.name === speaker &&
+      typeof lastEntry.text === 'string'
+    ) {
+      const ageMs = now - (lastEntry._timestamp || 0);
+      const correctionWindowMs = 8000;
+
+      if (ageMs <= correctionWindowMs) {
+        // New hypothesis extends previous one: keep a single clean line.
+        if (cleanText.length > lastEntry.text.length && cleanText.startsWith(lastEntry.text)) {
+          const oldLength = lastEntry.text.length;
+          lastEntry.text = cleanText;
+          lastEntry._timestamp = timestamp;
+          mtLog('zoom-caption:append-and-correct:update-last', {
+            speaker: speaker,
+            oldLength: oldLength,
+            newLength: cleanText.length
+          });
+          saveTranscript();
+          return;
+        }
+
+        // Transient shorter hypothesis: ignore to avoid replacing a better line.
+        if (lastEntry.text.length > cleanText.length && lastEntry.text.startsWith(cleanText)) {
+          mtLog('zoom-caption:append-and-correct:ignore-regression', {
+            speaker: speaker,
+            previousLength: lastEntry.text.length,
+            incomingLength: cleanText.length
+          });
+          return;
+        }
+      }
+    }
+
+    // Use speaker + normalized text as ID (stable dedupe for finalized lines)
     const textHash = Math.abs(normalizedKey.split('').reduce((a, c) => a * 31 + c.charCodeAt(0), 0)).toString(36);
     const entryId = `zoom-${textHash}`;
     const existing = transcript.find(e => e.id === entryId);
