@@ -761,6 +761,42 @@ if (isExtensionContextAvailable()) {
         sendResponse({ isRecording });
         return false;
       }
+      if (message.type === 'START_ZOOM_TRANSCRIPTION') {
+        if (PLATFORM !== 'zoom') {
+          sendResponse({ success: false, error: 'Not on Zoom' });
+          return false;
+        }
+        if (!window.__meetTranscriberZoomCaptureAPI) {
+          sendResponse({ success: false, error: 'Zoom capture API not ready' });
+          return false;
+        }
+        try {
+          const result = window.__meetTranscriberZoomCaptureAPI.startTranscription();
+          const status = window.__meetTranscriberZoomCaptureAPI.getTranscriptionStatus();
+          mtLog('start-zoom-transcription:requested', { result, status });
+          sendResponse({ success: result, status });
+          return false;
+        } catch (e) {
+          mtWarn('start-zoom-transcription:error', e && e.message);
+          sendResponse({ success: false, error: e && e.message ? e.message : 'Unknown error' });
+          return false;
+        }
+      }
+      if (message.type === 'GET_ZOOM_DEBUG_INFO') {
+        if (PLATFORM !== 'zoom' || !window.__meetTranscriberZoomCaptureAPI) {
+          sendResponse({ info: null });
+          return false;
+        }
+        try {
+          const debugInfo = window.__meetTranscriberZoomCaptureAPI.debugInfo();
+          const status = window.__meetTranscriberZoomCaptureAPI.getTranscriptionStatus();
+          sendResponse({ info: { ...debugInfo, ...status } });
+          return false;
+        } catch (e) {
+          sendResponse({ info: null, error: e && e.message });
+          return false;
+        }
+      }
     });
   } catch (e) {
     debugDevLog('runtime.onMessage', `listener registration skipped: ${e && e.message ? e.message : 'unknown error'}`);
@@ -1346,6 +1382,61 @@ if (PLATFORM === 'meet') {
       });
       saveTranscript();
     }
+  });
+}
+
+// ── Zoom: Caption capture from DOM monitoring ──────────────────
+//
+// Zoom captions are parsed from DOM mutations rather than WebRTC channels.
+// The zoom-capture.js (MAIN world) monitors #live-transcription-subtitle
+// and dispatches __mt_zoom_caption events.
+//
+if (PLATFORM === 'zoom') {
+  document.addEventListener('__mt_zoom_caption', (evt) => {
+    if (!isRecording) return;
+    const { speaker, text, timestamp } = evt.detail || {};
+
+    if (!text || !speaker) {
+      mtWarn('zoom-caption:skip-missing-required', {
+        hasText: !!text,
+        hasSpeaker: !!speaker
+      });
+      return;
+    }
+
+    const cleanText = sanitizeSpeechText(speaker, text.trim());
+    if (!cleanText) return;
+
+    // Use speaker + timestamp as composite ID (Zoom doesn't have messageId)
+    const entryId = `zoom-${speaker}-${timestamp}`;
+    const existing = transcript.find(e => e.id === entryId);
+
+    if (!existing) {
+      transcript.push({
+        id: entryId,
+        name: speaker,
+        text: cleanText,
+        _source: 'zoom-dom',
+        _timestamp: timestamp
+      });
+      mtLog('zoom-caption:new-entry', {
+        speaker: speaker,
+        textLength: cleanText.length,
+        transcriptLength: transcript.length
+      });
+      saveTranscript();
+    }
+  });
+
+  document.addEventListener('__mt_zoom_transcription_status', (evt) => {
+    const { isActive, menuVisible, timestamp } = evt.detail || {};
+    mtLog('zoom-transcription-status:changed', {
+      isActive: isActive,
+      menuVisible: menuVisible,
+      timestamp: timestamp
+    });
+    // Could trigger auto-start if transcription not active and recording started
+    // (conditional on user preference in future)
   });
 }
 

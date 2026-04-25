@@ -41,6 +41,12 @@
       "js": ["teams-capture.js"],
       "run_at": "document_start",
       "world": "MAIN"
+    },
+    {
+      "matches": ["*://zoom.us/*", "*://*.zoom.us/*"],
+      "js": ["zoom-capture.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
     }
   ]
 }
