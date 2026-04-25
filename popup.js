@@ -27,9 +27,6 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // Auto-record toggle (default ON — value is true when key absent)
   const autoRecordToggle = document.getElementById('autoRecordToggle');
-  // Tactiq-like visual mode for Meet: keep capture, hide native captions overlay.
-  const meetCaptionOverlayToggle = document.getElementById('meetCaptionOverlayToggle');
-  const meetCaptionBootstrapToggle = document.getElementById('meetCaptionBootstrapToggle');
 
   chrome.storage.local.get(['autoRecordEnabled'], (res) => {
     autoRecordToggle.checked = res.autoRecordEnabled !== undefined ? !!res.autoRecordEnabled : true;
@@ -37,24 +34,6 @@ document.addEventListener('DOMContentLoaded', () => {
 
   autoRecordToggle.addEventListener('change', () => {
     chrome.storage.local.set({ autoRecordEnabled: autoRecordToggle.checked });
-  });
-
-  chrome.storage.local.get(['meetCaptionOverlayHidden'], (res) => {
-    meetCaptionOverlayToggle.checked =
-      res.meetCaptionOverlayHidden !== undefined ? !!res.meetCaptionOverlayHidden : true;
-  });
-
-  meetCaptionOverlayToggle.addEventListener('change', () => {
-    chrome.storage.local.set({ meetCaptionOverlayHidden: meetCaptionOverlayToggle.checked });
-  });
-
-  chrome.storage.local.get(['meetTryEnableCaptionsOnStart'], (res) => {
-    meetCaptionBootstrapToggle.checked =
-      res.meetTryEnableCaptionsOnStart !== undefined ? !!res.meetTryEnableCaptionsOnStart : false;
-  });
-
-  meetCaptionBootstrapToggle.addEventListener('change', () => {
-    chrome.storage.local.set({ meetTryEnableCaptionsOnStart: meetCaptionBootstrapToggle.checked });
   });
 
   // ── Quick-record logic ──────────────────────────────────
