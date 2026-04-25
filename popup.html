@@ -171,6 +171,26 @@
       color: #475569;
       margin-top: 2px;
     }
+    .sidebar-input {
+      width: 100%;
+      margin-top: 6px;
+      padding: 6px 8px;
+      border-radius: 8px;
+      border: 1px solid rgba(255,255,255,.08);
+      background: rgba(255,255,255,.03);
+      color: #cbd5e1;
+      font-size: 11px;
+      font-family: 'Inter', sans-serif;
+    }
+    .sidebar-input::placeholder {
+      color: #64748b;
+    }
+    .sidebar-inline-fields {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      margin-top: 6px;
+    }
     /* Toggle switch */
     .sw {
       position: relative;
@@ -503,6 +523,33 @@
     </div>
     <label class="sw">
       <input type="checkbox" id="autoRecordToggle">
+      <span class="sw-slider"></span>
+    </label>
+  </div>
+
+  <div class="sidebar-row">
+    <div>
+      <div class="sidebar-row-label">Buzz Quality Mode</div>
+      <div class="sidebar-row-hint">Фильтрация шумных/нестабильных фраз в live-режиме</div>
+    </div>
+    <label class="sw">
+      <input type="checkbox" id="qualityFusionToggle">
+      <span class="sw-slider"></span>
+    </label>
+  </div>
+
+  <div class="sidebar-row">
+    <div style="width: 100%;">
+      <div class="sidebar-row-label">Whisper Backup (эксперимент)</div>
+      <div class="sidebar-row-hint">Записывать микрофон и отправлять чанки в Whisper endpoint как бэкап текста</div>
+      <input class="sidebar-input" type="text" id="whisperEndpointInput" placeholder="http://127.0.0.1:8765/transcribe">
+      <div class="sidebar-inline-fields">
+        <input class="sidebar-input" type="text" id="whisperLanguageInput" placeholder="ru">
+        <input class="sidebar-input" type="number" id="whisperChunkMsInput" min="2000" max="20000" step="500" placeholder="7000">
+      </div>
+    </div>
+    <label class="sw" style="align-self: flex-start; margin-top: 2px;">
+      <input type="checkbox" id="whisperBackupToggle">
       <span class="sw-slider"></span>
     </label>
   </div>

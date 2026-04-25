@@ -190,6 +190,13 @@ let storageStateInitialized = false;
 let storageStateTouchedLocally = false;
 let sidebarEnabled = false;    // off by default for stealth; user enables via popup
 let autoRecordEnabled = true;  // record automatically on join; user can disable via popup
+let qualityFusionEnabled = true; // Buzz-inspired live quality heuristics
+let minCaptionChars = 6; // Skip tiny noisy fragments
+let hideUnconfirmedEnabled = true; // Hide unstable short interim-looking fragments
+let whisperBackupEnabled = false; // Experimental backup ASR via external Whisper endpoint
+let whisperEndpoint = 'http://127.0.0.1:8765/transcribe';
+let whisperLanguage = 'ru';
+let whisperChunkMs = 7000;
 let meetCaptionOverlayHidden = true; // Tactiq-like default: capture continues while native overlay is hidden
 let meetTryEnableCaptionsOnStart = false; // Optional bootstrap: try enabling captions once on recording start
 let meetCaptionBootstrapAttemptedForSession = false;
@@ -202,6 +209,16 @@ let suppressNextMeetCaptionToggleClick = false;
 // before the meeting UI finishes rendering (Teams SPA issue).
 let meetingContainerEverSeen = false;
 let meetingUiMissingStreak = 0;
+
+const whisperBackupState = {
+  active: false,
+  stream: null,
+  recorder: null,
+  sessionToken: 0,
+  inFlight: 0,
+  lastText: '',
+  lastTextAt: 0
+};
 
 // Extract meeting code from URL
 function getMeetingCode() {
@@ -391,6 +408,40 @@ function sanitizeSpeechText(speakerName, speechText) {
   }
 
   return normalizedText;
+}
+
+function isSystemCaptionNoise(text) {
+  if (!text) return false;
+  const patterns = [
+    /turned on live transcription/i,
+    /turned off live transcription/i,
+    /you have turned on/i,
+    /you have turned off/i,
+    /has joined/i,
+    /has left/i,
+    /recording has started/i,
+    /recording has stopped/i,
+    /^alert$/i
+  ];
+  return patterns.some((rx) => rx.test(text));
+}
+
+function isLikelyUnconfirmedFragment(text) {
+  if (!text) return false;
+  if (/[.!?…]$/.test(text)) return false;
+  const words = text.split(/\s+/).filter(Boolean);
+  return words.length <= 3 && text.length < 24;
+}
+
+function applyLiveQualityFilters(text) {
+  if (!text) return '';
+  const normalized = text.replace(/\s+/g, ' ').trim();
+  if (!normalized) return '';
+  if (!qualityFusionEnabled) return normalized;
+  if (isSystemCaptionNoise(normalized)) return '';
+  if (normalized.length < Math.max(1, Number(minCaptionChars) || 1)) return '';
+  if (hideUnconfirmedEnabled && isLikelyUnconfirmedFragment(normalized)) return '';
+  return normalized;
 }
 
 function sanitizeZoomSpeechText(speechText) {
@@ -604,7 +655,23 @@ function setScopedRecordingState(nextIsRecording, nextTranscript) {
 }
 
 // ── Persistence ─────────────────────────────────────────────
-safeStorageGet([RECORDING_STORAGE_KEY, TRANSCRIPT_STORAGE_KEY, 'isRecording', 'transcript', 'sidebarEnabled', 'autoRecordEnabled', 'meetCaptionOverlayHidden', 'meetTryEnableCaptionsOnStart'], (res) => {
+safeStorageGet([
+  RECORDING_STORAGE_KEY,
+  TRANSCRIPT_STORAGE_KEY,
+  'isRecording',
+  'transcript',
+  'sidebarEnabled',
+  'autoRecordEnabled',
+  'meetCaptionOverlayHidden',
+  'meetTryEnableCaptionsOnStart',
+  'qualityFusionEnabled',
+  'minCaptionChars',
+  'hideUnconfirmedEnabled',
+  'whisperBackupEnabled',
+  'whisperEndpoint',
+  'whisperLanguage',
+  'whisperChunkMs'
+], (res) => {
   const scopedIsRecording = res[RECORDING_STORAGE_KEY];
   const scopedTranscript = res[TRANSCRIPT_STORAGE_KEY];
 
@@ -615,6 +682,13 @@ safeStorageGet([RECORDING_STORAGE_KEY, TRANSCRIPT_STORAGE_KEY, 'isRecording', 't
     legacyTranscriptLength: Array.isArray(res.transcript) ? res.transcript.length : -1,
     sidebarEnabled: res.sidebarEnabled,
     autoRecordEnabled: res.autoRecordEnabled,
+    qualityFusionEnabled: res.qualityFusionEnabled,
+    minCaptionChars: res.minCaptionChars,
+    hideUnconfirmedEnabled: res.hideUnconfirmedEnabled,
+    whisperBackupEnabled: res.whisperBackupEnabled,
+    whisperEndpoint: res.whisperEndpoint,
+    whisperLanguage: res.whisperLanguage,
+    whisperChunkMs: res.whisperChunkMs,
     meetCaptionOverlayHidden: res.meetCaptionOverlayHidden,
     meetTryEnableCaptionsOnStart: res.meetTryEnableCaptionsOnStart
   });
@@ -625,6 +699,19 @@ safeStorageGet([RECORDING_STORAGE_KEY, TRANSCRIPT_STORAGE_KEY, 'isRecording', 't
   if (res.sidebarEnabled !== undefined) {
     sidebarEnabled = !!res.sidebarEnabled;
   }
+  qualityFusionEnabled = res.qualityFusionEnabled !== undefined ? !!res.qualityFusionEnabled : true;
+  minCaptionChars = Number.isFinite(Number(res.minCaptionChars)) ? Math.max(1, Math.min(40, Number(res.minCaptionChars))) : 6;
+  hideUnconfirmedEnabled = res.hideUnconfirmedEnabled !== undefined ? !!res.hideUnconfirmedEnabled : true;
+  whisperBackupEnabled = res.whisperBackupEnabled !== undefined ? !!res.whisperBackupEnabled : false;
+  whisperEndpoint = typeof res.whisperEndpoint === 'string' && res.whisperEndpoint.trim()
+    ? res.whisperEndpoint.trim()
+    : 'http://127.0.0.1:8765/transcribe';
+  whisperLanguage = typeof res.whisperLanguage === 'string' && res.whisperLanguage.trim()
+    ? res.whisperLanguage.trim()
+    : 'ru';
+  whisperChunkMs = Number.isFinite(Number(res.whisperChunkMs))
+    ? Math.max(2000, Math.min(20000, Number(res.whisperChunkMs)))
+    : 7000;
   meetCaptionOverlayHidden = res.meetCaptionOverlayHidden !== undefined
     ? !!res.meetCaptionOverlayHidden
     : true;
@@ -656,6 +743,7 @@ safeStorageGet([RECORDING_STORAGE_KEY, TRANSCRIPT_STORAGE_KEY, 'isRecording', 't
       setScopedRecordingState(true, []);
       mtLog('storage-init:auto-start-enabled', { sessionId: currentSessionId });
       tryEnableMeetCaptionsOnRecordingStart('auto-start');
+      startWhisperBackupIfNeeded('auto-start');
     }
 
     // Always restore transcript from storage, regardless of autoRecordEnabled status.
@@ -671,11 +759,21 @@ safeStorageGet([RECORDING_STORAGE_KEY, TRANSCRIPT_STORAGE_KEY, 'isRecording', 't
   }
 
   storageStateInitialized = true;
+  if (isRecording) {
+    startWhisperBackupIfNeeded('storage-resume');
+  }
   mtLog('storage-init:complete', {
     isRecording: isRecording,
     transcriptLength: transcript.length,
     sidebarEnabled: sidebarEnabled,
     autoRecordEnabled: autoRecordEnabled,
+    qualityFusionEnabled: qualityFusionEnabled,
+    minCaptionChars: minCaptionChars,
+    hideUnconfirmedEnabled: hideUnconfirmedEnabled,
+    whisperBackupEnabled: whisperBackupEnabled,
+    whisperEndpoint: whisperEndpoint,
+    whisperLanguage: whisperLanguage,
+    whisperChunkMs: whisperChunkMs,
     meetCaptionOverlayHidden: meetCaptionOverlayHidden,
     meetTryEnableCaptionsOnStart: meetTryEnableCaptionsOnStart
   });
@@ -702,6 +800,49 @@ if (isExtensionContextAvailable()) {
         if (changes['autoRecordEnabled'] !== undefined) {
           autoRecordEnabled = !!changes['autoRecordEnabled'].newValue;
           mtLog('storage.onChanged:autoRecordEnabled', { autoRecordEnabled: autoRecordEnabled });
+        }
+        if (changes['qualityFusionEnabled'] !== undefined) {
+          qualityFusionEnabled = !!changes['qualityFusionEnabled'].newValue;
+          mtLog('storage.onChanged:qualityFusionEnabled', { qualityFusionEnabled: qualityFusionEnabled });
+        }
+        if (changes['minCaptionChars'] !== undefined) {
+          minCaptionChars = Math.max(1, Math.min(40, Number(changes['minCaptionChars'].newValue) || 6));
+          mtLog('storage.onChanged:minCaptionChars', { minCaptionChars: minCaptionChars });
+        }
+        if (changes['hideUnconfirmedEnabled'] !== undefined) {
+          hideUnconfirmedEnabled = !!changes['hideUnconfirmedEnabled'].newValue;
+          mtLog('storage.onChanged:hideUnconfirmedEnabled', { hideUnconfirmedEnabled: hideUnconfirmedEnabled });
+        }
+        if (changes['whisperBackupEnabled'] !== undefined) {
+          whisperBackupEnabled = !!changes['whisperBackupEnabled'].newValue;
+          mtLog('storage.onChanged:whisperBackupEnabled', { whisperBackupEnabled: whisperBackupEnabled });
+          if (!whisperBackupEnabled) {
+            stopWhisperBackup('disabled-by-setting');
+          } else if (isRecording) {
+            startWhisperBackupIfNeeded('enabled-by-setting');
+          }
+        }
+        if (changes['whisperEndpoint'] !== undefined) {
+          whisperEndpoint = typeof changes['whisperEndpoint'].newValue === 'string' && changes['whisperEndpoint'].newValue.trim()
+            ? changes['whisperEndpoint'].newValue.trim()
+            : 'http://127.0.0.1:8765/transcribe';
+          mtLog('storage.onChanged:whisperEndpoint', { whisperEndpoint: whisperEndpoint });
+        }
+        if (changes['whisperLanguage'] !== undefined) {
+          whisperLanguage = typeof changes['whisperLanguage'].newValue === 'string' && changes['whisperLanguage'].newValue.trim()
+            ? changes['whisperLanguage'].newValue.trim()
+            : 'ru';
+          mtLog('storage.onChanged:whisperLanguage', { whisperLanguage: whisperLanguage });
+        }
+        if (changes['whisperChunkMs'] !== undefined) {
+          whisperChunkMs = Math.max(2000, Math.min(20000, Number(changes['whisperChunkMs'].newValue) || 7000));
+          mtLog('storage.onChanged:whisperChunkMs', { whisperChunkMs: whisperChunkMs });
+          if (whisperBackupState.active) {
+            stopWhisperBackup('chunk-size-changed');
+            if (isRecording && whisperBackupEnabled) {
+              startWhisperBackupIfNeeded('chunk-size-changed');
+            }
+          }
         }
         if (changes['meetCaptionOverlayHidden'] !== undefined) {
           meetCaptionOverlayHidden = !!changes['meetCaptionOverlayHidden'].newValue;
@@ -742,6 +883,7 @@ if (isExtensionContextAvailable()) {
           setScopedRecordingState(true, []);
           mtLog('recording-start:manual-toggle', { sessionId: currentSessionId });
           tryEnableMeetCaptionsOnRecordingStart('manual-toggle');
+          startWhisperBackupIfNeeded('manual-toggle');
           // Close the transcript panel if the widget is already injected
           if (typeof window.__meetTranscriberSetPanelOpen === 'function') {
             window.__meetTranscriberSetPanelOpen(false);
@@ -760,6 +902,7 @@ if (isExtensionContextAvailable()) {
           }
           setScopedRecordingState(false, []);
           currentSessionId = null;
+          stopWhisperBackup('manual-toggle-stop');
         }
         refreshUI();
         sendResponse({ isRecording });
@@ -817,6 +960,156 @@ function saveTranscript() {
     safeStorageSet({ [TRANSCRIPT_STORAGE_KEY]: transcript });
     refreshUI();
   }, 500);
+}
+
+async function transcribeWhisperChunk(blob, sessionToken) {
+  if (!blob || !blob.size) return;
+  if (!whisperEndpoint) return;
+  if (sessionToken !== whisperBackupState.sessionToken) return;
+
+  whisperBackupState.inFlight += 1;
+  try {
+    const fd = new FormData();
+    fd.append('file', blob, 'chunk.webm');
+    if (whisperLanguage) {
+      fd.append('language', whisperLanguage);
+    }
+    fd.append('task', 'transcribe');
+
+    const resp = await fetch(whisperEndpoint, {
+      method: 'POST',
+      body: fd
+    });
+
+    if (!resp.ok) {
+      mtWarn('whisper-backup:transcribe-http-failed', { status: resp.status });
+      return;
+    }
+
+    const payload = await resp.json().catch(() => ({}));
+    const rawText = typeof payload.text === 'string'
+      ? payload.text
+      : (typeof payload.transcript === 'string' ? payload.transcript : '');
+    const filteredText = applyLiveQualityFilters(rawText);
+    if (!filteredText) return;
+
+    const now = Date.now();
+    if (
+      whisperBackupState.lastText === filteredText &&
+      now - whisperBackupState.lastTextAt < Math.max(1500, whisperChunkMs)
+    ) {
+      return;
+    }
+    whisperBackupState.lastText = filteredText;
+    whisperBackupState.lastTextAt = now;
+
+    const speaker = getUserRealName() || 'Whisper Backup';
+    const id = `whisper-${now}-${Math.floor(Math.random() * 10000)}`;
+    transcript.push({
+      id,
+      name: speaker,
+      text: filteredText,
+      _source: 'whisper-backup',
+      _timestamp: now
+    });
+    mtLog('whisper-backup:new-entry', {
+      textLength: filteredText.length,
+      transcriptLength: transcript.length
+    });
+    saveTranscript();
+  } catch (e) {
+    mtWarn('whisper-backup:transcribe-error', e && e.message ? e.message : 'unknown');
+  } finally {
+    whisperBackupState.inFlight = Math.max(0, whisperBackupState.inFlight - 1);
+  }
+}
+
+async function startWhisperBackupIfNeeded(trigger) {
+  if (!isRecording) return;
+  if (!whisperBackupEnabled) return;
+  if (whisperBackupState.active) return;
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    mtWarn('whisper-backup:unsupported-getUserMedia');
+    return;
+  }
+
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true
+      }
+    });
+
+    const preferredTypes = [
+      'audio/webm;codecs=opus',
+      'audio/webm',
+      'audio/ogg;codecs=opus'
+    ];
+    const mimeType = preferredTypes.find((t) => {
+      try {
+        return typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(t);
+      } catch (e) {
+        return false;
+      }
+    });
+
+    const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+    const token = whisperBackupState.sessionToken + 1;
+
+    whisperBackupState.sessionToken = token;
+    whisperBackupState.stream = stream;
+    whisperBackupState.recorder = recorder;
+    whisperBackupState.active = true;
+    whisperBackupState.lastText = '';
+    whisperBackupState.lastTextAt = 0;
+
+    recorder.addEventListener('dataavailable', (evt) => {
+      if (!evt.data || !evt.data.size) return;
+      transcribeWhisperChunk(evt.data, token);
+    });
+
+    recorder.addEventListener('error', (evt) => {
+      mtWarn('whisper-backup:recorder-error', evt && evt.error ? evt.error.message : 'unknown');
+    });
+
+    recorder.start(Math.max(2000, Number(whisperChunkMs) || 7000));
+    mtLog('whisper-backup:start', {
+      trigger: trigger || 'unspecified',
+      endpoint: whisperEndpoint,
+      chunkMs: whisperChunkMs,
+      mimeType: recorder.mimeType || mimeType || 'default'
+    });
+  } catch (e) {
+    mtWarn('whisper-backup:start-failed', e && e.message ? e.message : 'unknown');
+  }
+}
+
+function stopWhisperBackup(reason) {
+  if (!whisperBackupState.active) return;
+
+  try {
+    if (whisperBackupState.recorder && whisperBackupState.recorder.state !== 'inactive') {
+      whisperBackupState.recorder.stop();
+    }
+  } catch (e) {
+    mtWarn('whisper-backup:stop-recorder-failed', e && e.message ? e.message : 'unknown');
+  }
+
+  try {
+    if (whisperBackupState.stream) {
+      whisperBackupState.stream.getTracks().forEach((t) => t.stop());
+    }
+  } catch (e) {
+    mtWarn('whisper-backup:stop-stream-failed', e && e.message ? e.message : 'unknown');
+  }
+
+  whisperBackupState.active = false;
+  whisperBackupState.stream = null;
+  whisperBackupState.recorder = null;
+  whisperBackupState.sessionToken += 1;
+  mtLog('whisper-backup:stop', { reason: reason || 'unspecified' });
 }
 
 // ── Session Auto-Save ───────────────────────────────────────
@@ -919,6 +1212,7 @@ function stopAndSave(reason) {
     return;
   }
   finalizeSession();
+  stopWhisperBackup(reason || 'stopAndSave');
   isRecording = false;
   setScopedRecordingState(false, []);
   currentSessionId = null;
@@ -1099,6 +1393,7 @@ const captionObserver = new MutationObserver((mutations) => {
       }
 
       speechText = sanitizeSpeechText(speakerName, speechText);
+      speechText = applyLiveQualityFilters(speechText);
       if (!speechText) {
         mtLog('mutation-observer:skip-sanitized-empty');
         continue;
@@ -1361,7 +1656,8 @@ if (PLATFORM === 'meet') {
       speakerName = getUserRealName() || 'Speaker';
     }
 
-    const cleanText = sanitizeSpeechText(speakerName, text.trim());
+    let cleanText = sanitizeSpeechText(speakerName, text.trim());
+    cleanText = applyLiveQualityFilters(cleanText);
     if (!cleanText) return;
 
     const existing = transcript.find(e => e.id === messageId);
@@ -1417,7 +1713,8 @@ if (PLATFORM === 'zoom') {
       return;
     }
 
-    const cleanText = sanitizeSpeechText(speaker, text.trim());
+    let cleanText = sanitizeSpeechText(speaker, text.trim());
+    cleanText = applyLiveQualityFilters(cleanText);
     if (!cleanText) return;
 
     // Create normalized key for deduplication

@@ -27,14 +27,63 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // Auto-record toggle (default ON — value is true when key absent)
   const autoRecordToggle = document.getElementById('autoRecordToggle');
+  const qualityFusionToggle = document.getElementById('qualityFusionToggle');
+  const whisperBackupToggle = document.getElementById('whisperBackupToggle');
+  const whisperEndpointInput = document.getElementById('whisperEndpointInput');
+  const whisperLanguageInput = document.getElementById('whisperLanguageInput');
+  const whisperChunkMsInput = document.getElementById('whisperChunkMsInput');
 
   chrome.storage.local.get(['autoRecordEnabled'], (res) => {
     autoRecordToggle.checked = res.autoRecordEnabled !== undefined ? !!res.autoRecordEnabled : true;
   });
 
+  chrome.storage.local.get([
+    'qualityFusionEnabled',
+    'whisperBackupEnabled',
+    'whisperEndpoint',
+    'whisperLanguage',
+    'whisperChunkMs'
+  ], (res) => {
+    qualityFusionToggle.checked = res.qualityFusionEnabled !== undefined ? !!res.qualityFusionEnabled : true;
+    whisperBackupToggle.checked = !!res.whisperBackupEnabled;
+    whisperEndpointInput.value = typeof res.whisperEndpoint === 'string' && res.whisperEndpoint.trim()
+      ? res.whisperEndpoint.trim()
+      : 'http://127.0.0.1:8765/transcribe';
+    whisperLanguageInput.value = typeof res.whisperLanguage === 'string' && res.whisperLanguage.trim()
+      ? res.whisperLanguage.trim()
+      : 'ru';
+    whisperChunkMsInput.value = Number.isFinite(Number(res.whisperChunkMs))
+      ? String(Math.max(2000, Math.min(20000, Number(res.whisperChunkMs))))
+      : '7000';
+  });
+
   autoRecordToggle.addEventListener('change', () => {
     chrome.storage.local.set({ autoRecordEnabled: autoRecordToggle.checked });
   });
+
+  qualityFusionToggle.addEventListener('change', () => {
+    chrome.storage.local.set({ qualityFusionEnabled: qualityFusionToggle.checked });
+  });
+
+  whisperBackupToggle.addEventListener('change', () => {
+    chrome.storage.local.set({ whisperBackupEnabled: whisperBackupToggle.checked });
+  });
+
+  function persistWhisperInputs() {
+    const endpoint = (whisperEndpointInput.value || '').trim() || 'http://127.0.0.1:8765/transcribe';
+    const language = (whisperLanguageInput.value || '').trim() || 'ru';
+    const chunkMs = Math.max(2000, Math.min(20000, Number(whisperChunkMsInput.value) || 7000));
+    whisperChunkMsInput.value = String(chunkMs);
+    chrome.storage.local.set({
+      whisperEndpoint: endpoint,
+      whisperLanguage: language,
+      whisperChunkMs: chunkMs
+    });
+  }
+
+  whisperEndpointInput.addEventListener('change', persistWhisperInputs);
+  whisperLanguageInput.addEventListener('change', persistWhisperInputs);
+  whisperChunkMsInput.addEventListener('change', persistWhisperInputs);
 
   // ── Quick-record logic ──────────────────────────────────
   const MEETING_PATTERNS = [/meet\.google\.com/i, /teams\.microsoft\.com/i, /teams\.live\.com/i, /teams\.cloud\.microsoft/i, /zoom\.us\/wc\//i];
