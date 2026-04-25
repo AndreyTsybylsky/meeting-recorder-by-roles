@@ -29,6 +29,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const autoRecordToggle = document.getElementById('autoRecordToggle');
   const qualityFusionToggle = document.getElementById('qualityFusionToggle');
   const whisperBackupToggle = document.getElementById('whisperBackupToggle');
+  const whisperCaptureModeSelect = document.getElementById('whisperCaptureModeSelect');
   const whisperEndpointInput = document.getElementById('whisperEndpointInput');
   const whisperLanguageInput = document.getElementById('whisperLanguageInput');
   const whisperChunkMsInput = document.getElementById('whisperChunkMsInput');
@@ -40,12 +41,16 @@ document.addEventListener('DOMContentLoaded', () => {
   chrome.storage.local.get([
     'qualityFusionEnabled',
     'whisperBackupEnabled',
+    'whisperCaptureMode',
     'whisperEndpoint',
     'whisperLanguage',
     'whisperChunkMs'
   ], (res) => {
     qualityFusionToggle.checked = res.qualityFusionEnabled !== undefined ? !!res.qualityFusionEnabled : true;
     whisperBackupToggle.checked = !!res.whisperBackupEnabled;
+    whisperCaptureModeSelect.value = (typeof res.whisperCaptureMode === 'string' && ['mic', 'tab'].includes(res.whisperCaptureMode))
+      ? res.whisperCaptureMode
+      : 'tab';
     whisperEndpointInput.value = typeof res.whisperEndpoint === 'string' && res.whisperEndpoint.trim()
       ? res.whisperEndpoint.trim()
       : 'http://127.0.0.1:8765/transcribe';
@@ -67,6 +72,19 @@ document.addEventListener('DOMContentLoaded', () => {
 
   whisperBackupToggle.addEventListener('change', () => {
     chrome.storage.local.set({ whisperBackupEnabled: whisperBackupToggle.checked });
+    if (whisperBackupToggle.checked) {
+      resolveMeetingTab((tabId) => {
+        if (tabId === null) return;
+        chrome.tabs.sendMessage(tabId, { type: 'START_WHISPER_BACKUP' }, () => {
+          // Intentionally ignore runtime.lastError here; tab may still be initializing.
+        });
+      });
+    }
+  });
+
+  whisperCaptureModeSelect.addEventListener('change', () => {
+    const mode = whisperCaptureModeSelect.value === 'mic' ? 'mic' : 'tab';
+    chrome.storage.local.set({ whisperCaptureMode: mode });
   });
 
   function persistWhisperInputs() {

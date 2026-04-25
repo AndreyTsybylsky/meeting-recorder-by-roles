@@ -194,6 +194,7 @@ let qualityFusionEnabled = true; // Buzz-inspired live quality heuristics
 let minCaptionChars = 6; // Skip tiny noisy fragments
 let hideUnconfirmedEnabled = true; // Hide unstable short interim-looking fragments
 let whisperBackupEnabled = false; // Experimental backup ASR via external Whisper endpoint
+let whisperCaptureMode = 'tab'; // 'tab' (preferred for all participants) | 'mic'
 let whisperEndpoint = 'http://127.0.0.1:8765/transcribe';
 let whisperLanguage = 'ru';
 let whisperChunkMs = 7000;
@@ -213,6 +214,7 @@ let meetingUiMissingStreak = 0;
 const whisperBackupState = {
   active: false,
   stream: null,
+  sourceMode: 'unknown',
   recorder: null,
   sessionToken: 0,
   inFlight: 0,
@@ -668,6 +670,7 @@ safeStorageGet([
   'minCaptionChars',
   'hideUnconfirmedEnabled',
   'whisperBackupEnabled',
+  'whisperCaptureMode',
   'whisperEndpoint',
   'whisperLanguage',
   'whisperChunkMs'
@@ -686,6 +689,7 @@ safeStorageGet([
     minCaptionChars: res.minCaptionChars,
     hideUnconfirmedEnabled: res.hideUnconfirmedEnabled,
     whisperBackupEnabled: res.whisperBackupEnabled,
+    whisperCaptureMode: res.whisperCaptureMode,
     whisperEndpoint: res.whisperEndpoint,
     whisperLanguage: res.whisperLanguage,
     whisperChunkMs: res.whisperChunkMs,
@@ -703,6 +707,9 @@ safeStorageGet([
   minCaptionChars = Number.isFinite(Number(res.minCaptionChars)) ? Math.max(1, Math.min(40, Number(res.minCaptionChars))) : 6;
   hideUnconfirmedEnabled = res.hideUnconfirmedEnabled !== undefined ? !!res.hideUnconfirmedEnabled : true;
   whisperBackupEnabled = res.whisperBackupEnabled !== undefined ? !!res.whisperBackupEnabled : false;
+  whisperCaptureMode = typeof res.whisperCaptureMode === 'string' && ['mic', 'tab'].includes(res.whisperCaptureMode)
+    ? res.whisperCaptureMode
+    : 'tab';
   whisperEndpoint = typeof res.whisperEndpoint === 'string' && res.whisperEndpoint.trim()
     ? res.whisperEndpoint.trim()
     : 'http://127.0.0.1:8765/transcribe';
@@ -771,6 +778,7 @@ safeStorageGet([
     minCaptionChars: minCaptionChars,
     hideUnconfirmedEnabled: hideUnconfirmedEnabled,
     whisperBackupEnabled: whisperBackupEnabled,
+    whisperCaptureMode: whisperCaptureMode,
     whisperEndpoint: whisperEndpoint,
     whisperLanguage: whisperLanguage,
     whisperChunkMs: whisperChunkMs,
@@ -820,6 +828,17 @@ if (isExtensionContextAvailable()) {
             stopWhisperBackup('disabled-by-setting');
           } else if (isRecording) {
             startWhisperBackupIfNeeded('enabled-by-setting');
+          }
+        }
+        if (changes['whisperCaptureMode'] !== undefined) {
+          const nextMode = changes['whisperCaptureMode'].newValue;
+          whisperCaptureMode = typeof nextMode === 'string' && ['mic', 'tab'].includes(nextMode) ? nextMode : 'tab';
+          mtLog('storage.onChanged:whisperCaptureMode', { whisperCaptureMode: whisperCaptureMode });
+          if (whisperBackupState.active) {
+            stopWhisperBackup('capture-mode-changed');
+            if (isRecording && whisperBackupEnabled) {
+              startWhisperBackupIfNeeded('capture-mode-changed');
+            }
           }
         }
         if (changes['whisperEndpoint'] !== undefined) {
@@ -906,6 +925,11 @@ if (isExtensionContextAvailable()) {
         }
         refreshUI();
         sendResponse({ isRecording });
+        return false;
+      }
+      if (message.type === 'START_WHISPER_BACKUP') {
+        startWhisperBackupIfNeeded('popup-user-action');
+        sendResponse({ ok: true });
         return false;
       }
       if (message.type === 'START_ZOOM_TRANSCRIPTION') {
@@ -1028,19 +1052,61 @@ async function startWhisperBackupIfNeeded(trigger) {
   if (!isRecording) return;
   if (!whisperBackupEnabled) return;
   if (whisperBackupState.active) return;
-  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    mtWarn('whisper-backup:unsupported-getUserMedia');
+  if (!navigator.mediaDevices) {
+    mtWarn('whisper-backup:unsupported-mediaDevices');
     return;
   }
 
-  try {
-    const stream = await navigator.mediaDevices.getUserMedia({
+  async function getMicStream() {
+    if (!navigator.mediaDevices.getUserMedia) return null;
+    return navigator.mediaDevices.getUserMedia({
       audio: {
         echoCancellation: true,
         noiseSuppression: true,
         autoGainControl: true
       }
     });
+  }
+
+  async function getTabOrSystemAudioStream() {
+    if (!navigator.mediaDevices.getDisplayMedia) return null;
+    const display = await navigator.mediaDevices.getDisplayMedia({
+      video: true,
+      audio: true
+    });
+    const audioTracks = display.getAudioTracks();
+    if (!audioTracks || !audioTracks.length) {
+      // User selected source without audio. Stop display tracks immediately.
+      display.getTracks().forEach((t) => t.stop());
+      return null;
+    }
+    return new MediaStream(audioTracks);
+  }
+
+  try {
+    let stream = null;
+    let sourceMode = whisperCaptureMode;
+
+    if (whisperCaptureMode === 'tab') {
+      try {
+        stream = await getTabOrSystemAudioStream();
+      } catch (e) {
+        mtWarn('whisper-backup:tab-capture-failed', e && e.message ? e.message : 'unknown');
+      }
+      if (!stream) {
+        mtWarn('whisper-backup:tab-capture-no-audio-fallback-mic');
+        sourceMode = 'mic';
+        stream = await getMicStream();
+      }
+    } else {
+      stream = await getMicStream();
+      sourceMode = 'mic';
+    }
+
+    if (!stream) {
+      mtWarn('whisper-backup:start-failed-no-stream');
+      return;
+    }
 
     const preferredTypes = [
       'audio/webm;codecs=opus',
@@ -1060,6 +1126,7 @@ async function startWhisperBackupIfNeeded(trigger) {
 
     whisperBackupState.sessionToken = token;
     whisperBackupState.stream = stream;
+    whisperBackupState.sourceMode = sourceMode;
     whisperBackupState.recorder = recorder;
     whisperBackupState.active = true;
     whisperBackupState.lastText = '';
@@ -1077,6 +1144,8 @@ async function startWhisperBackupIfNeeded(trigger) {
     recorder.start(Math.max(2000, Number(whisperChunkMs) || 7000));
     mtLog('whisper-backup:start', {
       trigger: trigger || 'unspecified',
+      captureModeRequested: whisperCaptureMode,
+      captureModeActual: sourceMode,
       endpoint: whisperEndpoint,
       chunkMs: whisperChunkMs,
       mimeType: recorder.mimeType || mimeType || 'default'
@@ -1107,6 +1176,7 @@ function stopWhisperBackup(reason) {
 
   whisperBackupState.active = false;
   whisperBackupState.stream = null;
+  whisperBackupState.sourceMode = 'unknown';
   whisperBackupState.recorder = null;
   whisperBackupState.sessionToken += 1;
   mtLog('whisper-backup:stop', { reason: reason || 'unspecified' });

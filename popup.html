@@ -541,7 +541,11 @@
   <div class="sidebar-row">
     <div style="width: 100%;">
       <div class="sidebar-row-label">Whisper Backup (эксперимент)</div>
-      <div class="sidebar-row-hint">Записывать микрофон и отправлять чанки в Whisper endpoint как бэкап текста</div>
+      <div class="sidebar-row-hint">Режим tab/system: захват аудио вкладки/системы (голоса участников) через браузерный диалог</div>
+      <select class="sidebar-input" id="whisperCaptureModeSelect">
+        <option value="tab">tab/system audio (все участники)</option>
+        <option value="mic">microphone only (только мой голос)</option>
+      </select>
       <input class="sidebar-input" type="text" id="whisperEndpointInput" placeholder="http://127.0.0.1:8765/transcribe">
       <div class="sidebar-inline-fields">
         <input class="sidebar-input" type="text" id="whisperLanguageInput" placeholder="ru">
