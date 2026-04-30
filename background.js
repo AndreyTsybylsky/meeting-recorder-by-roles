@@ -21,6 +21,110 @@ function bgWarn(step, details) {
 
 bgLog('service-worker-init');
 
+const DEFAULT_WHISPER_ENDPOINT = 'http://127.0.0.1:8765/transcribe';
+
+function updateWhisperBackendState(nextState, callback) {
+  chrome.storage.local.set(nextState, () => {
+    if (chrome.runtime.lastError) {
+      bgWarn('WHISPER_BACKEND:storage.set:lastError', chrome.runtime.lastError.message || 'unknown');
+    }
+    if (typeof callback === 'function') callback();
+  });
+}
+
+function deriveWhisperHealthUrl(endpoint) {
+  const rawEndpoint = typeof endpoint === 'string' && endpoint.trim()
+    ? endpoint.trim()
+    : DEFAULT_WHISPER_ENDPOINT;
+
+  try {
+    const url = new URL(rawEndpoint);
+    if (url.pathname.endsWith('/transcribe')) {
+      url.pathname = url.pathname.slice(0, -'/transcribe'.length) + '/health';
+    } else if (url.pathname === '/' || url.pathname === '') {
+      url.pathname = '/health';
+    } else if (!url.pathname.endsWith('/health')) {
+      url.pathname = url.pathname.replace(/\/+$/, '') + '/health';
+    }
+    url.search = '';
+    return url.toString();
+  } catch (_error) {
+    return 'http://127.0.0.1:8765/health';
+  }
+}
+
+function checkWhisperBackendHealth(sendResponse) {
+  chrome.storage.local.get(['whisperEndpoint'], async (res) => {
+    const whisperEndpoint = typeof res.whisperEndpoint === 'string' && res.whisperEndpoint.trim()
+      ? res.whisperEndpoint.trim()
+      : DEFAULT_WHISPER_ENDPOINT;
+    const healthUrl = deriveWhisperHealthUrl(whisperEndpoint);
+    const checkedAt = Date.now();
+
+    updateWhisperBackendState({
+      whisperBackendStatus: 'checking',
+      whisperBackendLastError: '',
+      whisperBackendLastCheckedAt: checkedAt,
+      whisperBackendHealthUrl: healthUrl
+    });
+
+    try {
+      const resp = await fetch(healthUrl, {
+        method: 'GET',
+        cache: 'no-store'
+      });
+
+      if (!resp.ok) {
+        const error = 'http_' + String(resp.status);
+        updateWhisperBackendState({
+          whisperBackendStatus: 'error',
+          whisperBackendLastError: error,
+          whisperBackendLastCheckedAt: checkedAt,
+          whisperBackendHealthUrl: healthUrl
+        }, () => {
+          sendResponse({ ok: false, status: 'error', error, endpoint: whisperEndpoint, healthUrl });
+        });
+        return;
+      }
+
+      const payload = await resp.json().catch(() => ({}));
+      const rawStatus = payload && typeof payload.status === 'string' ? payload.status : 'ready';
+      const status = ['ready', 'error', 'installing'].includes(rawStatus) ? rawStatus : 'ready';
+      const storageStatus = status === 'installing' ? 'unavailable' : status;
+      const error = status === 'error' && payload && typeof payload.error === 'string'
+        ? payload.error
+        : '';
+
+      updateWhisperBackendState({
+        whisperBackendStatus: storageStatus,
+        whisperBackendLastError: error,
+        whisperBackendLastCheckedAt: checkedAt,
+        whisperBackendHealthUrl: healthUrl
+      }, () => {
+        sendResponse({
+          ok: status === 'ready',
+          status: storageStatus,
+          reportedStatus: status,
+          error,
+          endpoint: whisperEndpoint,
+          healthUrl,
+          payload
+        });
+      });
+    } catch (error) {
+      const message = error && error.message ? error.message : 'unreachable';
+      updateWhisperBackendState({
+        whisperBackendStatus: 'unavailable',
+        whisperBackendLastError: message,
+        whisperBackendLastCheckedAt: checkedAt,
+        whisperBackendHealthUrl: healthUrl
+      }, () => {
+        sendResponse({ ok: false, status: 'unavailable', error: message, endpoint: whisperEndpoint, healthUrl });
+      });
+    }
+  });
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   bgLog('runtime.onMessage', {
     type: message && message.type ? message.type : 'unknown',
@@ -86,6 +190,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     });
     
     return true; // async response
+  }
+
+  if (message.type === 'CHECK_WHISPER_BACKEND') {
+    checkWhisperBackendHealth(sendResponse);
+    return true;
   }
   
   if (message.type === 'DELETE_SESSION') {

@@ -1,0 +1,132 @@
+- generic [ref=e2]:
+  - generic [ref=e7]:
+    - generic [ref=e8]:
+      - img [ref=e11]
+      - button "Avatar" [ref=e18] [cursor=pointer]:
+        - generic [ref=e19]:
+          - img "Avatar" [ref=e21]
+          - img [ref=e23]:
+            - img [ref=e24]
+    - generic [ref=e28]:
+      - tablist [ref=e29]:
+        - tab "Home" [ref=e30] [cursor=pointer]:
+          - generic [ref=e31]:
+            - generic:
+              - img "Home":
+                - img
+            - generic: Home
+        - tab "Meetings" [ref=e32] [cursor=pointer]:
+          - generic [ref=e33]:
+            - generic:
+              - img "Meetings":
+                - img
+            - generic: Meetings
+        - generic [ref=e34]: Press shift+F10 to open the context menu. Press Alt or Option + Arrow Down to move tab to the right. Press Alt or Option + Arrow Up to move tab to the left.
+        - button "More" [ref=e35] [cursor=pointer]:
+          - generic [ref=e36]:
+            - generic:
+              - img "Ellipsis Horizontal":
+                - img
+            - generic: More
+      - button "Settings" [ref=e38] [cursor=pointer]:
+        - img [ref=e39]:
+          - img [ref=e40]
+  - iframe [active] [ref=e5]:
+    - generic [ref=f3e1]:
+      - generic:
+        - alert
+        - generic [ref=f3e10]:
+          - generic [ref=f3e11]:
+            - img [ref=f3e12]
+            - generic [ref=f3e14]:
+              - button "Meeting information" [ref=f3e16] [cursor=pointer]:
+                - img [ref=f3e17]
+              - separator [ref=f3e19]
+              - generic [ref=f3e22] [cursor=pointer]:
+                - group [ref=f3e24]:
+                  - button "View" [ref=f3e25]:
+                    - img [ref=f3e26]
+                    - generic [ref=f3e28]: View
+                - button "Enter Pip" [ref=f3e29]:
+                  - img [ref=f3e30]
+                - button "Enter Minimize" [ref=f3e32]:
+                  - img [ref=f3e33]
+          - generic [ref=f3e36]:
+            - generic [ref=f3e37]:
+              - generic [ref=f3e38]:
+                - button "mute my microphone" [ref=f3e39] [cursor=pointer]:
+                  - img [ref=f3e42]
+                  - generic [ref=f3e46]: Mute
+                - group [ref=f3e48]:
+                  - button "More audio controls" [ref=f3e49] [cursor=pointer]:
+                    - img [ref=f3e51]
+              - generic [ref=f3e53]:
+                - button "start my video" [ref=f3e54] [cursor=pointer]:
+                  - img [ref=f3e56]
+                  - generic [ref=f3e59]: Start Video
+                - group [ref=f3e61]:
+                  - button "More video controls" [ref=f3e62] [cursor=pointer]:
+                    - img [ref=f3e64]
+            - generic [ref=f3e66]:
+              - generic [ref=f3e67]:
+                - button "open the manage participants list pane,1 particpants" [ref=f3e69] [cursor=pointer]:
+                  - generic [ref=f3e70]:
+                    - img [ref=f3e71]
+                    - generic [ref=f3e74]: "1"
+                  - generic [ref=f3e75]: Participants
+                - generic [ref=f3e77]:
+                  - button "open the chat panel" [ref=f3e78] [cursor=pointer]:
+                    - img [ref=f3e80]
+                    - generic [ref=f3e83]: Chat
+                  - group [ref=f3e85]:
+                    - button "Chat Settings" [ref=f3e86] [cursor=pointer]:
+                      - img [ref=f3e88]
+                - button "Reactions" [ref=f3e93] [cursor=pointer]:
+                  - img [ref=f3e95]
+                  - generic [ref=f3e97]: Reactions
+                - generic [ref=f3e99]:
+                  - group [ref=f3e101]:
+                    - button "Share Screen" [ref=f3e102] [cursor=pointer]:
+                      - img [ref=f3e104]
+                      - generic [ref=f3e106]: Share Screen
+                  - group [ref=f3e108]:
+                    - button "Share permission setting" [ref=f3e109] [cursor=pointer]:
+                      - img [ref=f3e111]
+                - button "more security options" [ref=f3e114] [cursor=pointer]:
+                  - img [ref=f3e116]
+                  - generic [ref=f3e120]: Security
+              - generic [ref=f3e122]:
+                - generic:
+                  - menu:
+                    - generic:
+                      - generic:
+                        - group
+                        - generic [ref=f3e123]:
+                          - heading "Captions" [ref=f3e124]
+                          - button "Your caption settings grouping Show Captions" [active] [ref=f3e125] [cursor=pointer]: Show Captions
+                          - button "Host controls grouping My Caption Language" [ref=f3e126] [cursor=pointer]:
+                            - generic [ref=f3e127]: "Caption Language:"
+                            - generic [ref=f3e128]:
+                              - generic [ref=f3e129]: English
+                              - img [ref=f3e130]
+                          - button "Your caption settings grouping View full transcript" [ref=f3e132] [cursor=pointer]: View full transcript
+                          - heading "Host controls" [ref=f3e134]
+                          - button "Host Caption Control Settings" [ref=f3e135] [cursor=pointer]
+                - group "More meeting control" [ref=f3e137]:
+                  - button "More" [ref=f3e138] [cursor=pointer]:
+                    - img [ref=f3e140]
+                    - generic [ref=f3e143]: More
+            - status [ref=f3e144]
+            - button "End" [ref=f3e146] [cursor=pointer]:
+              - img [ref=f3e148]
+              - generic [ref=f3e152]: End
+          - generic [ref=f3e163]:
+            - generic [ref=f3e164]:
+              - img "Andrew Tsybulski"
+            - generic [ref=f3e165]: Andrew Tsybulski
+          - generic:
+            - generic:
+              - dialog
+          - generic:
+            - generic:
+              - dialog
