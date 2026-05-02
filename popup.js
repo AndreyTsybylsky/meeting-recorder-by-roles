@@ -28,119 +28,13 @@ document.addEventListener('DOMContentLoaded', () => {
   // Auto-record toggle (default ON — value is true when key absent)
   const autoRecordToggle = document.getElementById('autoRecordToggle');
   const qualityFusionToggle = document.getElementById('qualityFusionToggle');
-  const whisperBackupToggle = document.getElementById('whisperBackupToggle');
-  const whisperBackendStatusText = document.getElementById('whisperBackendStatusText');
-  const whisperBackendStatusHint = document.getElementById('whisperBackendStatusHint');
-  const whisperBackendCheckBtn = document.getElementById('whisperBackendCheckBtn');
-  const whisperCaptureModeSelect = document.getElementById('whisperCaptureModeSelect');
-  const whisperEndpointInput = document.getElementById('whisperEndpointInput');
-  const whisperLanguageInput = document.getElementById('whisperLanguageInput');
-  const whisperChunkMsInput = document.getElementById('whisperChunkMsInput');
-  let currentWhisperBackendStatus = 'unknown';
-  let currentWhisperBackendError = '';
-  let currentWhisperBackendCheckedAt = 0;
-
-  function formatWhisperBackendStatus(status) {
-    switch (status) {
-      case 'ready':
-        return 'Статус: готов';
-      case 'checking':
-        return 'Статус: проверка';
-      case 'unavailable':
-        return 'Статус: backend недоступен';
-      case 'error':
-        return 'Статус: ошибка backend';
-      default:
-        return 'Статус: не проверен';
-    }
-  }
-
-  function formatWhisperBackendHint(status, error, checkedAt) {
-    const checkedLabel = Number.isFinite(Number(checkedAt))
-      ? new Date(Number(checkedAt)).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
-      : '';
-
-    if (status === 'ready') {
-      return checkedLabel
-        ? `Локальный Whisper backend доступен. Последняя проверка: ${checkedLabel}`
-        : 'Локальный Whisper backend доступен';
-    }
-    if (status === 'checking') {
-      return 'Проверяем локальный Whisper backend на localhost';
-    }
-    if (status === 'unavailable') {
-      return error
-        ? `Локальный backend не отвечает: ${error}`
-        : 'Локальный backend не отвечает';
-    }
-    if (status === 'error') {
-      return error
-        ? `Backend ответил с ошибкой: ${error}`
-        : 'Backend ответил с ошибкой';
-    }
-    return 'Whisper включается только когда локальный backend отвечает на /health';
-  }
-
-  function renderWhisperBackendState(status, error, checkedAt) {
-    currentWhisperBackendStatus = typeof status === 'string' ? status : 'unknown';
-    currentWhisperBackendError = typeof error === 'string' ? error : '';
-    currentWhisperBackendCheckedAt = Number.isFinite(Number(checkedAt)) ? Number(checkedAt) : 0;
-    whisperBackendStatusText.textContent = formatWhisperBackendStatus(status);
-    whisperBackendStatusHint.textContent = formatWhisperBackendHint(currentWhisperBackendStatus, currentWhisperBackendError, currentWhisperBackendCheckedAt);
-    whisperBackendCheckBtn.disabled = status === 'checking';
-    whisperCaptureModeSelect.disabled = status === 'checking';
-  }
-
-  function checkWhisperBackend(callback) {
-    renderWhisperBackendState('checking', '', Date.now());
-    chrome.runtime.sendMessage({ type: 'CHECK_WHISPER_BACKEND' }, (response) => {
-      if (chrome.runtime.lastError) {
-        renderWhisperBackendState('error', chrome.runtime.lastError.message || 'runtime_error', Date.now());
-        if (typeof callback === 'function') callback({ ok: false, status: 'error' });
-        return;
-      }
-
-      const status = response && typeof response.status === 'string' ? response.status : 'error';
-      const error = response && typeof response.error === 'string' ? response.error : '';
-      renderWhisperBackendState(status, error, Date.now());
-      if (typeof callback === 'function') callback(response || { ok: false, status, error });
-    });
-  }
 
   chrome.storage.local.get(['autoRecordEnabled'], (res) => {
     autoRecordToggle.checked = res.autoRecordEnabled !== undefined ? !!res.autoRecordEnabled : true;
   });
 
-  chrome.storage.local.get([
-    'qualityFusionEnabled',
-    'whisperBackupEnabled',
-    'whisperCaptureMode',
-    'whisperEndpoint',
-    'whisperLanguage',
-    'whisperChunkMs',
-    'whisperBackendStatus',
-    'whisperBackendLastError',
-    'whisperBackendLastCheckedAt'
-  ], (res) => {
+  chrome.storage.local.get(['qualityFusionEnabled'], (res) => {
     qualityFusionToggle.checked = res.qualityFusionEnabled !== undefined ? !!res.qualityFusionEnabled : true;
-    whisperBackupToggle.checked = !!res.whisperBackupEnabled;
-    whisperCaptureModeSelect.value = (typeof res.whisperCaptureMode === 'string' && ['mic', 'tab'].includes(res.whisperCaptureMode))
-      ? res.whisperCaptureMode
-      : 'tab';
-    whisperEndpointInput.value = typeof res.whisperEndpoint === 'string' && res.whisperEndpoint.trim()
-      ? res.whisperEndpoint.trim()
-      : 'http://127.0.0.1:8765/transcribe';
-    whisperLanguageInput.value = typeof res.whisperLanguage === 'string' && res.whisperLanguage.trim()
-      ? res.whisperLanguage.trim()
-      : 'ru';
-    whisperChunkMsInput.value = Number.isFinite(Number(res.whisperChunkMs))
-      ? String(Math.max(2000, Math.min(20000, Number(res.whisperChunkMs))))
-      : '7000';
-    renderWhisperBackendState(
-      typeof res.whisperBackendStatus === 'string' ? res.whisperBackendStatus : 'unknown',
-      typeof res.whisperBackendLastError === 'string' ? res.whisperBackendLastError : '',
-      Number.isFinite(Number(res.whisperBackendLastCheckedAt)) ? Number(res.whisperBackendLastCheckedAt) : 0
-    );
   });
 
   autoRecordToggle.addEventListener('change', () => {
@@ -150,70 +44,6 @@ document.addEventListener('DOMContentLoaded', () => {
   qualityFusionToggle.addEventListener('change', () => {
     chrome.storage.local.set({ qualityFusionEnabled: qualityFusionToggle.checked });
   });
-
-  whisperBackupToggle.addEventListener('change', () => {
-    chrome.storage.local.set({ whisperBackupEnabled: whisperBackupToggle.checked });
-    if (whisperBackupToggle.checked) {
-      checkWhisperBackend((response) => {
-        if (!response || response.status !== 'ready') return;
-        resolveMeetingTab((tabId) => {
-          if (tabId === null) return;
-          chrome.tabs.sendMessage(tabId, { type: 'START_WHISPER_BACKUP' }, () => {
-            // Intentionally ignore runtime.lastError here; tab may still be initializing.
-          });
-        });
-      });
-    }
-  });
-
-  whisperCaptureModeSelect.addEventListener('change', () => {
-    const mode = whisperCaptureModeSelect.value === 'mic' ? 'mic' : 'tab';
-    chrome.storage.local.set({ whisperCaptureMode: mode });
-  });
-
-  function persistWhisperInputs() {
-    const endpoint = (whisperEndpointInput.value || '').trim() || 'http://127.0.0.1:8765/transcribe';
-    const language = (whisperLanguageInput.value || '').trim() || 'ru';
-    const chunkMs = Math.max(2000, Math.min(20000, Number(whisperChunkMsInput.value) || 7000));
-    whisperChunkMsInput.value = String(chunkMs);
-    chrome.storage.local.set({
-      whisperEndpoint: endpoint,
-      whisperLanguage: language,
-      whisperChunkMs: chunkMs
-    });
-    checkWhisperBackend();
-  }
-
-  whisperEndpointInput.addEventListener('change', persistWhisperInputs);
-  whisperLanguageInput.addEventListener('change', persistWhisperInputs);
-  whisperChunkMsInput.addEventListener('change', persistWhisperInputs);
-  whisperBackendCheckBtn.addEventListener('click', () => {
-    checkWhisperBackend();
-  });
-
-  chrome.storage.onChanged.addListener((changes, area) => {
-    if (area !== 'local') return;
-
-    const nextStatus = changes['whisperBackendStatus'] !== undefined
-      ? (typeof changes['whisperBackendStatus'].newValue === 'string' ? changes['whisperBackendStatus'].newValue : 'unknown')
-      : null;
-    const nextError = changes['whisperBackendLastError'] !== undefined
-      ? (typeof changes['whisperBackendLastError'].newValue === 'string' ? changes['whisperBackendLastError'].newValue : '')
-      : null;
-    const nextCheckedAt = changes['whisperBackendLastCheckedAt'] !== undefined
-      ? (Number.isFinite(Number(changes['whisperBackendLastCheckedAt'].newValue)) ? Number(changes['whisperBackendLastCheckedAt'].newValue) : 0)
-      : null;
-
-    if (nextStatus !== null || nextError !== null || nextCheckedAt !== null) {
-      renderWhisperBackendState(
-        nextStatus !== null ? nextStatus : currentWhisperBackendStatus,
-        nextError !== null ? nextError : currentWhisperBackendError,
-        nextCheckedAt !== null ? nextCheckedAt : currentWhisperBackendCheckedAt
-      );
-    }
-  });
-
-  checkWhisperBackend();
 
   // ── Quick-record logic ──────────────────────────────────
   const MEETING_PATTERNS = [/meet\.google\.com/i, /teams\.microsoft\.com/i, /teams\.live\.com/i, /teams\.cloud\.microsoft/i, /zoom\.us\/wc\//i];

@@ -186,7 +186,6 @@ function destroyWidget() {
 let isRecording = false;
 let transcript = []; // Array of { id: string, name: string, text: string }
 let captionBuffer = [];
-let asrBuffer = [];
 let currentSessionId = null;
 let storageStateInitialized = false;
 let storageStateTouchedLocally = false;
@@ -195,13 +194,6 @@ let autoRecordEnabled = true;  // record automatically on join; user can disable
 let qualityFusionEnabled = true; // Buzz-inspired live quality heuristics
 let minCaptionChars = 6; // Skip tiny noisy fragments
 let hideUnconfirmedEnabled = true; // Hide unstable short interim-looking fragments
-let whisperBackupEnabled = false; // Experimental backup ASR via external Whisper endpoint
-let whisperBackendStatus = 'unknown';
-let whisperBackendLastError = '';
-let whisperCaptureMode = 'tab'; // 'tab' (preferred for all participants) | 'mic'
-let whisperEndpoint = 'http://127.0.0.1:8765/transcribe';
-let whisperLanguage = 'ru';
-let whisperChunkMs = 7000;
 let meetCaptionOverlayHidden = true; // Tactiq-like default: capture continues while native overlay is hidden
 let meetTryEnableCaptionsOnStart = false; // Optional bootstrap: try enabling captions once on recording start
 let meetCaptionBootstrapAttemptedForSession = false;
@@ -215,17 +207,6 @@ let suppressNextMeetCaptionToggleClick = false;
 let meetingContainerEverSeen = false;
 let meetingUiMissingStreak = 0;
 
-const whisperBackupState = {
-  active: false,
-  stream: null,
-  sourceMode: 'unknown',
-  recorder: null,
-  sessionToken: 0,
-  inFlight: 0,
-  lastText: '',
-  lastTextAt: 0
-};
-
 const MAX_STREAM_BUFFER_ITEMS = 500;
 
 function trimStreamBuffer(buffer) {
@@ -237,7 +218,6 @@ function trimStreamBuffer(buffer) {
 
 function resetStreamBuffers() {
   captionBuffer = [];
-  asrBuffer = [];
 }
 
 function upsertCaptionBufferEvent(event) {
@@ -263,41 +243,11 @@ function upsertCaptionBufferEvent(event) {
   return normalizedEvent;
 }
 
-function appendAsrBufferEvent(event) {
-  if (!event || !event.id || !event.text) return null;
-  const normalizedEvent = {
-    id: event.id,
-    source: event.source || 'whisper-backup',
-    startTs: Number.isFinite(Number(event.startTs)) ? Number(event.startTs) : Date.now(),
-    endTs: Number.isFinite(Number(event.endTs)) ? Number(event.endTs) : Date.now(),
-    speakerName: event.speakerName || 'Whisper Backup',
-    text: event.text,
-    isFinal: event.isFinal !== undefined ? !!event.isFinal : true
-  };
-
-  asrBuffer.push(normalizedEvent);
-  trimStreamBuffer(asrBuffer);
-  return normalizedEvent;
-}
-
 function rebuildStreamBuffersFromTranscript() {
   resetStreamBuffers();
   transcript.forEach((item) => {
     if (!item || !item.id || !item.text) return;
     const timestamp = Number.isFinite(Number(item._timestamp)) ? Number(item._timestamp) : Date.now();
-    if (item._source === 'whisper-backup') {
-      appendAsrBufferEvent({
-        id: item.id,
-        source: item._source,
-        startTs: timestamp,
-        endTs: timestamp,
-        speakerName: item.name || 'Whisper Backup',
-        text: item.text,
-        isFinal: true
-      });
-      return;
-    }
-
     upsertCaptionBufferEvent({
       id: item.id,
       source: item._source || 'captions',
@@ -581,7 +531,6 @@ function findDuplicateCaptionEntry(text, speakerName, excludeId) {
   for (let i = transcript.length - 1; i >= 0; i--) {
     const entry = transcript[i];
     if (!entry || entry.id === excludeId || !entry.text) continue;
-    if (entry._source === 'whisper-backup') continue;
     if (!isSameSpeakerForDedupe(entry.name, speakerName)) continue;
     if (isSameLiveCaptionText(entry.text, text)) return entry;
   }
@@ -639,10 +588,10 @@ function compactDuplicateCaptionEntries() {
   let removed = 0;
   for (let i = 0; i < transcript.length; i++) {
     const base = transcript[i];
-    if (!base || base._source === 'whisper-backup') continue;
+    if (!base) continue;
     for (let j = i + 1; j < transcript.length; j++) {
       const candidate = transcript[j];
-      if (!candidate || candidate._source === 'whisper-backup') continue;
+      if (!candidate) continue;
       if (!isSameSpeakerForDedupe(base.name, candidate.name)) continue;
       if (!isSameLiveCaptionText(base.text, candidate.text)) continue;
       mergeDuplicateCaptionEntry(base, {
@@ -762,6 +711,39 @@ function getUserRealName() {
   }
 
   return null;
+}
+
+function isSelfPlaceholderName(name) {
+  const normalized = normalizeSpeakerForDedupe(name);
+  return normalized === 'you' || normalized === '\u0432\u044b';
+}
+
+function backfillSelfSpeakerName() {
+  const realName = getUserRealName();
+  if (!realName) return 0;
+
+  let patched = 0;
+  transcript.forEach((entry) => {
+    if (!entry || !isSelfPlaceholderName(entry.name)) return;
+    entry.name = realName;
+    entry._selfUnresolved = false;
+    upsertCaptionBufferEvent({
+      id: entry.id,
+      source: entry._source || 'captions',
+      speakerName: realName,
+      text: entry.text,
+      isFinal: true
+    });
+    patched++;
+  });
+
+  if (patched > 0) {
+    mtLog('speaker-name:backfilled-self', {
+      realName,
+      patched
+    });
+  }
+  return patched;
 }
 
 const STORAGE_SCOPE = `${PLATFORM}:${getMeetingCode()}`;
@@ -888,14 +870,7 @@ safeStorageGet([
   'meetTryEnableCaptionsOnStart',
   'qualityFusionEnabled',
   'minCaptionChars',
-  'hideUnconfirmedEnabled',
-  'whisperBackupEnabled',
-  'whisperBackendStatus',
-  'whisperBackendLastError',
-  'whisperCaptureMode',
-  'whisperEndpoint',
-  'whisperLanguage',
-  'whisperChunkMs'
+  'hideUnconfirmedEnabled'
 ], (res) => {
   const scopedIsRecording = res[RECORDING_STORAGE_KEY];
   const scopedTranscript = res[TRANSCRIPT_STORAGE_KEY];
@@ -910,13 +885,6 @@ safeStorageGet([
     qualityFusionEnabled: res.qualityFusionEnabled,
     minCaptionChars: res.minCaptionChars,
     hideUnconfirmedEnabled: res.hideUnconfirmedEnabled,
-    whisperBackupEnabled: res.whisperBackupEnabled,
-    whisperBackendStatus: res.whisperBackendStatus,
-    whisperBackendLastError: res.whisperBackendLastError,
-    whisperCaptureMode: res.whisperCaptureMode,
-    whisperEndpoint: res.whisperEndpoint,
-    whisperLanguage: res.whisperLanguage,
-    whisperChunkMs: res.whisperChunkMs,
     meetCaptionOverlayHidden: res.meetCaptionOverlayHidden,
     meetTryEnableCaptionsOnStart: res.meetTryEnableCaptionsOnStart
   });
@@ -930,21 +898,6 @@ safeStorageGet([
   qualityFusionEnabled = res.qualityFusionEnabled !== undefined ? !!res.qualityFusionEnabled : true;
   minCaptionChars = Number.isFinite(Number(res.minCaptionChars)) ? Math.max(1, Math.min(40, Number(res.minCaptionChars))) : 6;
   hideUnconfirmedEnabled = res.hideUnconfirmedEnabled !== undefined ? !!res.hideUnconfirmedEnabled : true;
-  whisperBackupEnabled = res.whisperBackupEnabled !== undefined ? !!res.whisperBackupEnabled : false;
-  whisperBackendStatus = typeof res.whisperBackendStatus === 'string' ? res.whisperBackendStatus : 'unknown';
-  whisperBackendLastError = typeof res.whisperBackendLastError === 'string' ? res.whisperBackendLastError : '';
-  whisperCaptureMode = typeof res.whisperCaptureMode === 'string' && ['mic', 'tab'].includes(res.whisperCaptureMode)
-    ? res.whisperCaptureMode
-    : 'tab';
-  whisperEndpoint = typeof res.whisperEndpoint === 'string' && res.whisperEndpoint.trim()
-    ? res.whisperEndpoint.trim()
-    : 'http://127.0.0.1:8765/transcribe';
-  whisperLanguage = typeof res.whisperLanguage === 'string' && res.whisperLanguage.trim()
-    ? res.whisperLanguage.trim()
-    : 'ru';
-  whisperChunkMs = Number.isFinite(Number(res.whisperChunkMs))
-    ? Math.max(2000, Math.min(20000, Number(res.whisperChunkMs)))
-    : 7000;
   meetCaptionOverlayHidden = res.meetCaptionOverlayHidden !== undefined
     ? !!res.meetCaptionOverlayHidden
     : true;
@@ -976,7 +929,6 @@ safeStorageGet([
       setScopedRecordingState(true, []);
       mtLog('storage-init:auto-start-enabled', { sessionId: currentSessionId });
       tryEnableMeetCaptionsOnRecordingStart('auto-start');
-      startWhisperBackupIfNeeded('auto-start');
     }
 
     // Always restore transcript from storage, regardless of autoRecordEnabled status.
@@ -992,9 +944,6 @@ safeStorageGet([
   }
 
   storageStateInitialized = true;
-  if (isRecording) {
-    startWhisperBackupIfNeeded('storage-resume');
-  }
   mtLog('storage-init:complete', {
     isRecording: isRecording,
     transcriptLength: transcript.length,
@@ -1003,13 +952,6 @@ safeStorageGet([
     qualityFusionEnabled: qualityFusionEnabled,
     minCaptionChars: minCaptionChars,
     hideUnconfirmedEnabled: hideUnconfirmedEnabled,
-    whisperBackupEnabled: whisperBackupEnabled,
-    whisperBackendStatus: whisperBackendStatus,
-    whisperBackendLastError: whisperBackendLastError,
-    whisperCaptureMode: whisperCaptureMode,
-    whisperEndpoint: whisperEndpoint,
-    whisperLanguage: whisperLanguage,
-    whisperChunkMs: whisperChunkMs,
     meetCaptionOverlayHidden: meetCaptionOverlayHidden,
     meetTryEnableCaptionsOnStart: meetTryEnableCaptionsOnStart
   });
@@ -1048,66 +990,6 @@ if (isExtensionContextAvailable()) {
         if (changes['hideUnconfirmedEnabled'] !== undefined) {
           hideUnconfirmedEnabled = !!changes['hideUnconfirmedEnabled'].newValue;
           mtLog('storage.onChanged:hideUnconfirmedEnabled', { hideUnconfirmedEnabled: hideUnconfirmedEnabled });
-        }
-        if (changes['whisperBackupEnabled'] !== undefined) {
-          whisperBackupEnabled = !!changes['whisperBackupEnabled'].newValue;
-          mtLog('storage.onChanged:whisperBackupEnabled', { whisperBackupEnabled: whisperBackupEnabled });
-          if (!whisperBackupEnabled) {
-            stopWhisperBackup('disabled-by-setting');
-          } else if (isRecording) {
-            startWhisperBackupIfNeeded('enabled-by-setting');
-          }
-        }
-        if (changes['whisperBackendStatus'] !== undefined) {
-          const previousStatus = whisperBackendStatus;
-          whisperBackendStatus = typeof changes['whisperBackendStatus'].newValue === 'string'
-            ? changes['whisperBackendStatus'].newValue
-            : 'unknown';
-          mtLog('storage.onChanged:whisperBackendStatus', { whisperBackendStatus: whisperBackendStatus });
-          if (whisperBackupState.active && whisperBackendStatus !== 'ready') {
-            stopWhisperBackup('backend-no-longer-ready');
-          } else if (!whisperBackupState.active && previousStatus !== 'ready' && whisperBackendStatus === 'ready' && isRecording && whisperBackupEnabled) {
-            startWhisperBackupIfNeeded('backend-became-ready');
-          }
-        }
-        if (changes['whisperBackendLastError'] !== undefined) {
-          whisperBackendLastError = typeof changes['whisperBackendLastError'].newValue === 'string'
-            ? changes['whisperBackendLastError'].newValue
-            : '';
-          mtLog('storage.onChanged:whisperBackendLastError', { whisperBackendLastError: whisperBackendLastError });
-        }
-        if (changes['whisperCaptureMode'] !== undefined) {
-          const nextMode = changes['whisperCaptureMode'].newValue;
-          whisperCaptureMode = typeof nextMode === 'string' && ['mic', 'tab'].includes(nextMode) ? nextMode : 'tab';
-          mtLog('storage.onChanged:whisperCaptureMode', { whisperCaptureMode: whisperCaptureMode });
-          if (whisperBackupState.active) {
-            stopWhisperBackup('capture-mode-changed');
-            if (isRecording && whisperBackupEnabled) {
-              startWhisperBackupIfNeeded('capture-mode-changed');
-            }
-          }
-        }
-        if (changes['whisperEndpoint'] !== undefined) {
-          whisperEndpoint = typeof changes['whisperEndpoint'].newValue === 'string' && changes['whisperEndpoint'].newValue.trim()
-            ? changes['whisperEndpoint'].newValue.trim()
-            : 'http://127.0.0.1:8765/transcribe';
-          mtLog('storage.onChanged:whisperEndpoint', { whisperEndpoint: whisperEndpoint });
-        }
-        if (changes['whisperLanguage'] !== undefined) {
-          whisperLanguage = typeof changes['whisperLanguage'].newValue === 'string' && changes['whisperLanguage'].newValue.trim()
-            ? changes['whisperLanguage'].newValue.trim()
-            : 'ru';
-          mtLog('storage.onChanged:whisperLanguage', { whisperLanguage: whisperLanguage });
-        }
-        if (changes['whisperChunkMs'] !== undefined) {
-          whisperChunkMs = Math.max(2000, Math.min(20000, Number(changes['whisperChunkMs'].newValue) || 7000));
-          mtLog('storage.onChanged:whisperChunkMs', { whisperChunkMs: whisperChunkMs });
-          if (whisperBackupState.active) {
-            stopWhisperBackup('chunk-size-changed');
-            if (isRecording && whisperBackupEnabled) {
-              startWhisperBackupIfNeeded('chunk-size-changed');
-            }
-          }
         }
         if (changes['meetCaptionOverlayHidden'] !== undefined) {
           meetCaptionOverlayHidden = !!changes['meetCaptionOverlayHidden'].newValue;
@@ -1148,7 +1030,6 @@ if (isExtensionContextAvailable()) {
           setScopedRecordingState(true, []);
           mtLog('recording-start:manual-toggle', { sessionId: currentSessionId });
           tryEnableMeetCaptionsOnRecordingStart('manual-toggle');
-          startWhisperBackupIfNeeded('manual-toggle');
           // Close the transcript panel if the widget is already injected
           if (typeof window.__meetTranscriberSetPanelOpen === 'function') {
             window.__meetTranscriberSetPanelOpen(false);
@@ -1167,15 +1048,9 @@ if (isExtensionContextAvailable()) {
           }
           setScopedRecordingState(false, []);
           currentSessionId = null;
-          stopWhisperBackup('manual-toggle-stop');
         }
         refreshUI();
         sendResponse({ isRecording });
-        return false;
-      }
-      if (message.type === 'START_WHISPER_BACKUP') {
-        startWhisperBackupIfNeeded('popup-user-action');
-        sendResponse({ ok: true });
         return false;
       }
       if (message.type === 'START_ZOOM_TRANSCRIPTION') {
@@ -1226,6 +1101,7 @@ function saveTranscript() {
   clearTimeout(saveTimeout);
   mtLog('saveTranscript:scheduled', { transcriptLength: transcript.length });
   saveTimeout = setTimeout(() => {
+    backfillSelfSpeakerName();
     compactDuplicateCaptionEntries();
     mtLog('saveTranscript:flush', { transcriptLength: transcript.length });
     safeStorageSet({ [TRANSCRIPT_STORAGE_KEY]: transcript });
@@ -1233,220 +1109,10 @@ function saveTranscript() {
   }, 500);
 }
 
-async function transcribeWhisperChunk(blob, sessionToken) {
-  if (!blob || !blob.size) return;
-  if (!whisperEndpoint) return;
-  if (sessionToken !== whisperBackupState.sessionToken) return;
-
-  whisperBackupState.inFlight += 1;
-  try {
-    const fd = new FormData();
-    fd.append('file', blob, 'chunk.webm');
-    if (whisperLanguage) {
-      fd.append('language', whisperLanguage);
-    }
-    fd.append('task', 'transcribe');
-
-    const resp = await fetch(whisperEndpoint, {
-      method: 'POST',
-      body: fd
-    });
-
-    if (!resp.ok) {
-      mtWarn('whisper-backup:transcribe-http-failed', { status: resp.status });
-      return;
-    }
-
-    const payload = await resp.json().catch(() => ({}));
-    const rawText = typeof payload.text === 'string'
-      ? payload.text
-      : (typeof payload.transcript === 'string' ? payload.transcript : '');
-    const filteredText = applyLiveQualityFilters(rawText);
-    if (!filteredText) return;
-
-    const now = Date.now();
-    if (
-      whisperBackupState.lastText === filteredText &&
-      now - whisperBackupState.lastTextAt < Math.max(1500, whisperChunkMs)
-    ) {
-      return;
-    }
-    whisperBackupState.lastText = filteredText;
-    whisperBackupState.lastTextAt = now;
-
-    const speaker = getUserRealName() || 'Whisper Backup';
-    const id = `whisper-${now}-${Math.floor(Math.random() * 10000)}`;
-    appendAsrBufferEvent({
-      id,
-      source: 'whisper-backup',
-      startTs: now,
-      endTs: now,
-      speakerName: speaker,
-      text: filteredText,
-      isFinal: true
-    });
-    transcript.push({
-      id,
-      name: speaker,
-      text: filteredText,
-      _source: 'whisper-backup',
-      _timestamp: now
-    });
-    mtLog('whisper-backup:new-entry', {
-      textLength: filteredText.length,
-      transcriptLength: transcript.length
-    });
-    saveTranscript();
-  } catch (e) {
-    mtWarn('whisper-backup:transcribe-error', e && e.message ? e.message : 'unknown');
-  } finally {
-    whisperBackupState.inFlight = Math.max(0, whisperBackupState.inFlight - 1);
-  }
-}
-
-async function startWhisperBackupIfNeeded(trigger) {
-  if (!isRecording) return;
-  if (!whisperBackupEnabled) return;
-  if (whisperBackendStatus !== 'ready') {
-    mtWarn('whisper-backup:backend-not-ready', {
-      status: whisperBackendStatus,
-      error: whisperBackendLastError || 'none'
-    });
-    return;
-  }
-  if (whisperBackupState.active) return;
-  if (!navigator.mediaDevices) {
-    mtWarn('whisper-backup:unsupported-mediaDevices');
-    return;
-  }
-
-  async function getMicStream() {
-    if (!navigator.mediaDevices.getUserMedia) return null;
-    return navigator.mediaDevices.getUserMedia({
-      audio: {
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true
-      }
-    });
-  }
-
-  async function getTabOrSystemAudioStream() {
-    if (!navigator.mediaDevices.getDisplayMedia) return null;
-    const display = await navigator.mediaDevices.getDisplayMedia({
-      video: true,
-      audio: true
-    });
-    const audioTracks = display.getAudioTracks();
-    if (!audioTracks || !audioTracks.length) {
-      // User selected source without audio. Stop display tracks immediately.
-      display.getTracks().forEach((t) => t.stop());
-      return null;
-    }
-    return new MediaStream(audioTracks);
-  }
-
-  try {
-    let stream = null;
-    let sourceMode = whisperCaptureMode;
-
-    if (whisperCaptureMode === 'tab') {
-      try {
-        stream = await getTabOrSystemAudioStream();
-      } catch (e) {
-        mtWarn('whisper-backup:tab-capture-failed', e && e.message ? e.message : 'unknown');
-      }
-      if (!stream) {
-        mtWarn('whisper-backup:tab-capture-no-audio-fallback-mic');
-        sourceMode = 'mic';
-        stream = await getMicStream();
-      }
-    } else {
-      stream = await getMicStream();
-      sourceMode = 'mic';
-    }
-
-    if (!stream) {
-      mtWarn('whisper-backup:start-failed-no-stream');
-      return;
-    }
-
-    const preferredTypes = [
-      'audio/webm;codecs=opus',
-      'audio/webm',
-      'audio/ogg;codecs=opus'
-    ];
-    const mimeType = preferredTypes.find((t) => {
-      try {
-        return typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(t);
-      } catch (e) {
-        return false;
-      }
-    });
-
-    const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
-    const token = whisperBackupState.sessionToken + 1;
-
-    whisperBackupState.sessionToken = token;
-    whisperBackupState.stream = stream;
-    whisperBackupState.sourceMode = sourceMode;
-    whisperBackupState.recorder = recorder;
-    whisperBackupState.active = true;
-    whisperBackupState.lastText = '';
-    whisperBackupState.lastTextAt = 0;
-
-    recorder.addEventListener('dataavailable', (evt) => {
-      if (!evt.data || !evt.data.size) return;
-      transcribeWhisperChunk(evt.data, token);
-    });
-
-    recorder.addEventListener('error', (evt) => {
-      mtWarn('whisper-backup:recorder-error', evt && evt.error ? evt.error.message : 'unknown');
-    });
-
-    recorder.start(Math.max(2000, Number(whisperChunkMs) || 7000));
-    mtLog('whisper-backup:start', {
-      trigger: trigger || 'unspecified',
-      captureModeRequested: whisperCaptureMode,
-      captureModeActual: sourceMode,
-      endpoint: whisperEndpoint,
-      chunkMs: whisperChunkMs,
-      mimeType: recorder.mimeType || mimeType || 'default'
-    });
-  } catch (e) {
-    mtWarn('whisper-backup:start-failed', e && e.message ? e.message : 'unknown');
-  }
-}
-
-function stopWhisperBackup(reason) {
-  if (!whisperBackupState.active) return;
-
-  try {
-    if (whisperBackupState.recorder && whisperBackupState.recorder.state !== 'inactive') {
-      whisperBackupState.recorder.stop();
-    }
-  } catch (e) {
-    mtWarn('whisper-backup:stop-recorder-failed', e && e.message ? e.message : 'unknown');
-  }
-
-  try {
-    if (whisperBackupState.stream) {
-      whisperBackupState.stream.getTracks().forEach((t) => t.stop());
-    }
-  } catch (e) {
-    mtWarn('whisper-backup:stop-stream-failed', e && e.message ? e.message : 'unknown');
-  }
-
-  whisperBackupState.active = false;
-  whisperBackupState.stream = null;
-  whisperBackupState.sourceMode = 'unknown';
-  whisperBackupState.recorder = null;
-  whisperBackupState.sessionToken += 1;
-  mtLog('whisper-backup:stop', { reason: reason || 'unspecified' });
-}
-
 // ── Session Auto-Save ───────────────────────────────────────
 function finalizeSession() {
+  backfillSelfSpeakerName();
+  compactDuplicateCaptionEntries();
   mtLog('finalizeSession:start', {
     transcriptLength: transcript.length,
     currentSessionId: currentSessionId
@@ -1547,7 +1213,6 @@ function stopAndSave(reason) {
     return;
   }
   finalizeSession();
-  stopWhisperBackup(reason || 'stopAndSave');
   isRecording = false;
   setScopedRecordingState(false, []);
   currentSessionId = null;
