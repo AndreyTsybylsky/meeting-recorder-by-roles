@@ -2087,22 +2087,10 @@ const MEET_CAPTION_LABEL_HINTS = [
 ];
 
 function injectMeetCaptionHideStyle() {
-  if (document.getElementById(MEET_CAPTION_HIDE_STYLE_ID)) return;
-  const style = document.createElement('style');
-  style.id = MEET_CAPTION_HIDE_STYLE_ID;
-  // Hide the entire captions bar (.a4cQT) so it collapses completely.
-  // display:none is safe — MutationObserver fires regardless of CSS display,
-  // and RTC capture runs in the MAIN world so CSS cannot affect it.
-  // Inner selectors are belt-and-braces for Meet builds that render the bar
-  // outside .a4cQT.
-  style.textContent =
-    ".a4cQT," +
-    "div[jsname='dsyhDe'],div[jsname='dqMPrb']," +
-    "div[jsname='W297wb'],.nMcdL,[jsname='YSZ4cc'],[jsname='Vpvi7b']," +
-    "div:has(>div[jsname='dsyhDe']),div:has(>div[jsname='dqMPrb'])" +
-    "{display:none!important}";
-  document.head.appendChild(style);
-  mtLog('caption-keeper:hide-style-injected');
+  // Do not style Meet's native caption bar. On current Meet builds compacting
+  // .a4cQT can leave a persistent black overlay and break normal CC toggling.
+  // Capture is kept alive by the MAIN-world RTC captions channel instead.
+  removeMeetCaptionHideStyle();
 }
 
 function removeMeetCaptionHideStyle() {
@@ -2151,8 +2139,8 @@ function isMeetCaptionsEnabled(btn) {
   const label = getMeetControlLabel(btn);
   if (!label) return null;
 
-  // When captions bar is CSS-hidden, Meet's label can become unreliable
-  // (often always "Show captions"). Avoid false toggles from label-only state.
+  // When captions bar is extension-styled, Meet's label can become unreliable.
+  // Avoid false toggles from label-only state.
   if (document.getElementById(MEET_CAPTION_HIDE_STYLE_ID)) return null;
 
   // "turn on/show" => currently off, "turn off/hide" => currently on.
@@ -2170,9 +2158,11 @@ function clearMeetCaptionBootstrapTimer() {
 
 // Re-enable server-side captions (e.g. after showing the bar, or after a drop).
 // Uses suppressNextMeetCaptionToggleClick so our click interceptor ignores it.
-function ensureMeetCaptionsEnabled() {
+function ensureMeetCaptionsEnabled(options = {}) {
   const btn = getMeetCaptionsToggleButton();
-  if (!btn || isMeetCaptionsEnabled(btn) !== false) return;
+  if (!btn) return false;
+  const enabled = isMeetCaptionsEnabled(btn);
+  if (enabled !== false && !options.forceClick) return false;
   suppressNextMeetCaptionToggleClick = true;
   meetCaptionEnabledByBootstrap = true;
   try {
@@ -2181,7 +2171,11 @@ function ensureMeetCaptionsEnabled() {
   } finally {
     suppressNextMeetCaptionToggleClick = false;
   }
-  mtLog('caption-keeper:ensure-enabled:clicked');
+  mtLog('caption-keeper:ensure-enabled:clicked', {
+    forced: !!options.forceClick,
+    detectedEnabled: enabled
+  });
+  return true;
 }
 
 function tryEnableMeetCaptionsOnRecordingStart(trigger) {
@@ -2286,28 +2280,15 @@ if (PLATFORM === 'meet') {
     if (suppressNextMeetCaptionToggleClick) return;
 
     if (meetCaptionOverlayHidden) {
-      // Captions overlay is in "hidden" mode. Intercept the click so Meet does NOT
-      // toggle server-side captions (which would stop the DataChannel stream).
-      // Use CSS presence — NOT the button label — as truth: when .a4cQT is
-      // display:none Meet always reports the button as "Show captions" regardless
-      // of actual server-side state, making label-based detection unreliable.
-      evt.preventDefault();
-      evt.stopImmediatePropagation();
-
-      if (document.getElementById(MEET_CAPTION_HIDE_STYLE_ID)) {
-        // Bar is currently hidden → user wants to show it.
-        removeMeetCaptionHideStyle();
-        window.dispatchEvent(new Event('resize'));
-        ensureMeetCaptionsEnabled(); // re-confirm server-side captions are ON
-        meetCaptionManualVisible = true;
-        mtLog('caption-keeper:intercept-user-showed-bar');
-      } else {
-        // Bar is currently visible → user wants to hide it.
-        injectMeetCaptionHideStyle();
-        window.dispatchEvent(new Event('resize'));
-        meetCaptionManualVisible = false;
-        mtLog('caption-keeper:intercept-user-hid-bar');
-      }
+      // Let the native Meet CC button work normally. RTC capture is independent
+      // from the visual overlay, and blocking this click traps users with an
+      // unclosable caption bar on current Meet builds.
+      setTimeout(() => {
+        const enabled = isMeetCaptionsEnabled(ccBtn);
+        meetCaptionEnabledByBootstrap = false;
+        meetCaptionManualVisible = enabled !== false;
+        mtLog('caption-keeper:native-toggle-tracked', { enabled });
+      }, 120);
       return;
     }
 
@@ -2339,6 +2320,45 @@ if (PLATFORM === 'meet') {
     meetSoftRecoverCount = 0;
   });
 
+  document.addEventListener('__mt_meet_channel_state', (evt) => {
+    if (!isRecording) return;
+
+    const detail = (evt && evt.detail) || {};
+    if (detail.label !== 'captions') return;
+
+    mtLog('meet-capture:channel-state', detail);
+
+    if (detail.state !== 'close') return;
+
+    const now = Date.now();
+    if (now - lastMeetRecoveryAt < 3000) return;
+    lastMeetRecoveryAt = now;
+
+    setTimeout(() => {
+      if (!isRecording) return;
+
+      // Reattach the RTC channel. Do not force-click Meet's CC button while the
+      // user is allowed to close native captions; that would reopen the visual
+      // overlay immediately after they close it.
+      const clicked = meetCaptionOverlayHidden
+        ? false
+        : ensureMeetCaptionsEnabled({ forceClick: false });
+      mtWarn('caption-keeper:on-channel-close', {
+        clicked: clicked,
+        overlayHidden: meetCaptionOverlayHidden,
+        channel: detail
+      });
+
+      document.dispatchEvent(new CustomEvent('__mt_meet_recover_capture', {
+        detail: {
+          reason: 'caption-channel-close',
+          channel: detail,
+          transcriptLength: transcript.length
+        }
+      }));
+    }, 800);
+  });
+
   setInterval(() => {
     if (!isRecording) {
       // Remove the hide overlay when not recording so the user can use
@@ -2363,9 +2383,9 @@ if (PLATFORM === 'meet') {
     if (meetCaptionBootstrapTimer) return;
 
     // meetCaptionManualVisible is managed exclusively by the click interceptor.
-    // Do NOT re-derive it from button state here: when .a4cQT is display:none
-    // Meet always reports the button as "Show captions" regardless of server state,
-    // which would incorrectly override the user's explicit toggle choice.
+    // Do NOT re-derive it from button state here: while the extension styles the
+    // overlay, Meet can report a misleading captions label and override the
+    // user's explicit toggle choice.
     if (meetCaptionOverlayHidden && !meetCaptionManualVisible) {
       injectMeetCaptionHideStyle();
     } else {
