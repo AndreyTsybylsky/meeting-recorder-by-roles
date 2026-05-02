@@ -539,6 +539,133 @@ function applyLiveQualityFilters(text) {
   return normalized;
 }
 
+function normalizeTranscriptTextForDedupe(text) {
+  return String(text || '')
+    .replace(/\s+/g, ' ')
+    .replace(/[.,!?;:]+$/g, '')
+    .trim()
+    .toLowerCase();
+}
+
+function normalizeSpeakerForDedupe(name) {
+  return String(name || '').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+function isSelfSpeakerAlias(name) {
+  const normalized = normalizeSpeakerForDedupe(name);
+  if (!normalized) return false;
+  if (normalized === 'you' || normalized === '\u0432\u044b') return true;
+  const realName = getUserRealName();
+  return !!realName && normalized === normalizeSpeakerForDedupe(realName);
+}
+
+function isSameSpeakerForDedupe(a, b) {
+  const left = normalizeSpeakerForDedupe(a);
+  const right = normalizeSpeakerForDedupe(b);
+  if (left && right && left === right) return true;
+  if (isSelfSpeakerAlias(a) && (isSelfSpeakerAlias(b) || isRealName(b))) return true;
+  if (isSelfSpeakerAlias(b) && (isSelfSpeakerAlias(a) || isRealName(a))) return true;
+  return false;
+}
+
+function isSameLiveCaptionText(a, b) {
+  const left = normalizeTranscriptTextForDedupe(a);
+  const right = normalizeTranscriptTextForDedupe(b);
+  if (!left || !right) return false;
+  if (left === right) return true;
+  if (Math.min(left.length, right.length) < 35) return false;
+  return left.startsWith(right) || right.startsWith(left);
+}
+
+function findDuplicateCaptionEntry(text, speakerName, excludeId) {
+  for (let i = transcript.length - 1; i >= 0; i--) {
+    const entry = transcript[i];
+    if (!entry || entry.id === excludeId || !entry.text) continue;
+    if (entry._source === 'whisper-backup') continue;
+    if (!isSameSpeakerForDedupe(entry.name, speakerName)) continue;
+    if (isSameLiveCaptionText(entry.text, text)) return entry;
+  }
+  return null;
+}
+
+function preferCaptionName(currentName, nextName) {
+  if (!nextName) return currentName || 'Speaker';
+  if (!currentName || currentName === 'Speaker') return nextName;
+  if (isSelfSpeakerAlias(currentName) && !/^(you|\u0432\u044b)$/i.test(normalizeSpeakerForDedupe(nextName))) {
+    return nextName;
+  }
+  return currentName;
+}
+
+function mergeDuplicateCaptionEntry(existing, next) {
+  if (!existing || !next || !next.text) return false;
+  const nextText = next.text;
+  const shouldReplaceText = normalizeTranscriptTextForDedupe(nextText).length > normalizeTranscriptTextForDedupe(existing.text).length;
+  const nextName = preferCaptionName(existing.name, next.name);
+  let changed = false;
+
+  if (shouldReplaceText && existing.text !== nextText) {
+    existing.text = nextText;
+    changed = true;
+  }
+
+  if (nextName && existing.name !== nextName) {
+    existing.name = nextName;
+    changed = true;
+  }
+
+  if (next.source && !existing._source) {
+    existing._source = next.source;
+  }
+  if (Number.isFinite(Number(next.rtcVersion))) {
+    existing._rtcVersion = Math.max(Number(existing._rtcVersion) || 0, Number(next.rtcVersion));
+  }
+  existing._selfUnresolved = false;
+
+  if (changed) {
+    upsertCaptionBufferEvent({
+      id: existing.id,
+      source: existing._source || next.source || 'captions',
+      speakerName: existing.name,
+      text: existing.text,
+      isFinal: true
+    });
+  }
+
+  return changed;
+}
+
+function compactDuplicateCaptionEntries() {
+  let removed = 0;
+  for (let i = 0; i < transcript.length; i++) {
+    const base = transcript[i];
+    if (!base || base._source === 'whisper-backup') continue;
+    for (let j = i + 1; j < transcript.length; j++) {
+      const candidate = transcript[j];
+      if (!candidate || candidate._source === 'whisper-backup') continue;
+      if (!isSameSpeakerForDedupe(base.name, candidate.name)) continue;
+      if (!isSameLiveCaptionText(base.text, candidate.text)) continue;
+      mergeDuplicateCaptionEntry(base, {
+        name: candidate.name,
+        text: candidate.text,
+        source: candidate._source || 'captions',
+        rtcVersion: candidate._rtcVersion
+      });
+      transcript.splice(j, 1);
+      removed++;
+      j--;
+    }
+  }
+  if (removed > 0) {
+    rebuildStreamBuffersFromTranscript();
+    mtWarn('transcript-dedupe:compacted', {
+      removed: removed,
+      transcriptLength: transcript.length
+    });
+  }
+  return removed;
+}
+
 function sanitizeZoomSpeechText(speechText) {
   if (!speechText) return '';
 
@@ -1099,6 +1226,7 @@ function saveTranscript() {
   clearTimeout(saveTimeout);
   mtLog('saveTranscript:scheduled', { transcriptLength: transcript.length });
   saveTimeout = setTimeout(() => {
+    compactDuplicateCaptionEntries();
     mtLog('saveTranscript:flush', { transcriptLength: transcript.length });
     safeStorageSet({ [TRANSCRIPT_STORAGE_KEY]: transcript });
     refreshUI();
@@ -1633,6 +1761,29 @@ const captionObserver = new MutationObserver((mutations) => {
           saveTranscript();
         }
       } else {
+        const duplicateEntry = PLATFORM === 'meet'
+          ? findDuplicateCaptionEntry(speechText, speakerName, blockId)
+          : null;
+        if (duplicateEntry) {
+          const merged = mergeDuplicateCaptionEntry(duplicateEntry, {
+            name: speakerName,
+            text: speechText,
+            source: 'captions-dom'
+          });
+          mtLog('mutation-observer:dedupe-merged-entry', {
+            blockId: blockId,
+            existingId: duplicateEntry.id,
+            merged: merged,
+            speakerName: duplicateEntry.name,
+            textLength: duplicateEntry.text.length
+          });
+          if (merged) {
+            saveTranscript();
+            refreshUI();
+          }
+          continue;
+        }
+
         upsertCaptionBufferEvent({
           id: blockId,
           source: 'captions-dom',
@@ -1640,7 +1791,14 @@ const captionObserver = new MutationObserver((mutations) => {
           text: speechText,
           isFinal: true
         });
-        transcript.push({ id: blockId, name: speakerName, text: speechText, _selfUnresolved: isUnresolvedSelf && !getUserRealName() });
+        transcript.push({
+          id: blockId,
+          name: speakerName,
+          text: speechText,
+          _source: 'captions-dom',
+          _timestamp: Date.now(),
+          _selfUnresolved: isUnresolvedSelf && !getUserRealName()
+        });
         mtLog('mutation-observer:new-entry', {
           blockId: blockId,
           speakerName: speakerName,
@@ -1928,6 +2086,30 @@ if (PLATFORM === 'meet') {
         saveTranscript();
       }
     } else {
+      const duplicateEntry = findDuplicateCaptionEntry(cleanText, speakerName, messageId);
+      if (duplicateEntry) {
+        const merged = mergeDuplicateCaptionEntry(duplicateEntry, {
+          name: speakerName,
+          text: cleanText,
+          source: _source || 'captions',
+          rtcVersion: messageVersion
+        });
+        markMeetCaptionActivity(_source || 'rtc-dedupe');
+        mtLog('meet-caption:dedupe-merged-entry', {
+          messageId: messageId,
+          existingId: duplicateEntry.id,
+          merged: merged,
+          messageVersion: messageVersion,
+          speakerName: duplicateEntry.name,
+          textLength: duplicateEntry.text.length
+        });
+        if (merged) {
+          saveTranscript();
+          refreshUI();
+        }
+        return;
+      }
+
       upsertCaptionBufferEvent({
         id: messageId,
         source: _source || 'captions',
@@ -1935,7 +2117,14 @@ if (PLATFORM === 'meet') {
         text: cleanText,
         isFinal: true
       });
-      transcript.push({ id: messageId, name: speakerName, text: cleanText, _rtcVersion: messageVersion });
+      transcript.push({
+        id: messageId,
+        name: speakerName,
+        text: cleanText,
+        _source: _source || 'captions',
+        _timestamp: Date.now(),
+        _rtcVersion: messageVersion
+      });
       markMeetCaptionActivity(_source || 'rtc-new');
       mtLog('meet-caption:new-entry', {
         messageId: messageId,
