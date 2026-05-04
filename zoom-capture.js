@@ -63,7 +63,19 @@
     /has joined/i,
     /has left/i,
     /is now/i,
-    /changed.*name/i
+    /changed.*name/i,
+    /new update available/i,
+    /local data storage/i,
+    /improve app performance/i,
+    /not recommended on public/i,
+    /clear data on logout/i,
+    /disableenable/i,
+    /weeklyupdate/i,
+    /zoom workplace/i,
+    /host tools/i,
+    /ai companion/i,
+    /participants/i,
+    /mute\s*video/i
   ];
 
   function isSystemMessage(text) {
@@ -81,6 +93,73 @@
     return (text || '').toLowerCase().replace(/\s+/g, ' ').trim();
   }
 
+  function getZoomDocument() {
+    var iframe = document.querySelector('#webclient') || document.querySelector('iframe');
+    return iframe && iframe.contentDocument ? iframe.contentDocument : document;
+  }
+
+  function getVisibleRect(el) {
+    if (!el || !el.getBoundingClientRect) return null;
+    var rect = el.getBoundingClientRect();
+    if (!rect || rect.width <= 0 || rect.height <= 0) return null;
+    return rect;
+  }
+
+  function isUiContainer(el) {
+    if (!el || !el.closest) return false;
+    return !!el.closest([
+      '[role="dialog"]',
+      '[role="menu"]',
+      '[role="navigation"]',
+      '[class*="setting" i]',
+      '[class*="chat" i]',
+      '[class*="sidebar" i]',
+      '[class*="notification" i]',
+      '[class*="toast" i]',
+      '[class*="popover" i]',
+      '[class*="modal" i]',
+      '[class*="menu" i]',
+      '[class*="toolbar" i]'
+    ].join(','));
+  }
+
+  function isLikelyCaptionElement(el) {
+    var text = normalizeText(el && el.textContent);
+    if (!text || text.length < 3 || text.length > 260) return false;
+    if (isSystemMessage(text)) return false;
+    if (isUiContainer(el)) return false;
+
+    var rect = getVisibleRect(el);
+    if (!rect) return false;
+
+    var ownerDocument = el.ownerDocument || document;
+    var ownerWindow = ownerDocument.defaultView || window;
+    var viewportHeight = ownerWindow.innerHeight || ownerDocument.documentElement.clientHeight || 0;
+    var viewportWidth = ownerWindow.innerWidth || ownerDocument.documentElement.clientWidth || 0;
+    if (!viewportHeight || !viewportWidth) return false;
+
+    // Zoom web captions render as a compact bubble in the lower half of the
+    // meeting stage. This rejects settings panels and app-wide live regions.
+    if (rect.top < viewportHeight * 0.50) return false;
+    if (rect.bottom > viewportHeight - 24) return false;
+    if (rect.width > viewportWidth * 0.86 || rect.height > viewportHeight * 0.30) return false;
+    if (rect.left < 40 || rect.right > viewportWidth - 40) return false;
+
+    return true;
+  }
+
+  function keepLeafCaptionElements(elements) {
+    return elements.filter(function (el, idx) {
+      for (var k = 0; k < elements.length; k++) {
+        if (k === idx) continue;
+        if (el.contains(elements[k]) && normalizeText(elements[k].textContent)) {
+          return false;
+        }
+      }
+      return true;
+    });
+  }
+
   function textSimilarity(a, b) {
     // Simple similarity check: if normalized texts match, they're similar
     return normalizeText(a) === normalizeText(b);
@@ -91,30 +170,72 @@
     captionMonitorActive = true;
     log('caption-monitor:start');
 
-    // Zoom caption selectors (most reliable: #live-transcription-subtitle or aria-live)
-    var captionSelectors = [
+    // Zoom caption selectors (most reliable: #live-transcription-subtitle).
+    // Keep this stricter than the content-script fallback: broad aria-live regions
+    // can contain unrelated app notifications and cause transcript overwrites.
+    var primaryCaptionSelectors = [
       '#live-transcription-subtitle',
       '.live-transcription-subtitle__box',
-      '[aria-live="assertive"]',
-      '[aria-live="polite"]',
+      '.live-transcription-subtitle__item',
+      '[class*="live-transcription-subtitle" i]',
+      '[class*="closed-caption" i]',
+      '[class*="caption-subtitle" i]'
+    ];
+    var fallbackCaptionSelectors = [
       '[data-testid*="caption" i]',
       '.rcvideo-box .caption',
-      '[class*="subtitle-item"]'
+      '[class*="subtitle-item"]',
+      '[class*="caption" i]',
+      '[class*="subtitle" i]',
+      '[id*="caption" i]',
+      '[id*="subtitle" i]'
     ];
 
     function findCaptionElements() {
-      var elements = [];
-      for (var i = 0; i < captionSelectors.length; i++) {
-        var selector = captionSelectors[i];
-        var nodeList = document.querySelectorAll(selector);
-        for (var j = 0; j < nodeList.length; j++) {
-          var el = nodeList[j];
-          if (el && el.textContent && el.textContent.trim().length > 0) {
-            elements.push(el);
-          }
+      var targetDocument = getZoomDocument();
+
+      var transcriptonicTarget = targetDocument.querySelector('.live-transcription-subtitle__box');
+      if (transcriptonicTarget && transcriptonicTarget.lastChild) {
+        var lastText = normalizeText(transcriptonicTarget.lastChild.textContent);
+        if (lastText && lastText.length >= 3 && lastText.length <= 260 && !isSystemMessage(lastText)) {
+          return [transcriptonicTarget.lastChild];
         }
       }
-      return elements;
+
+      function collectFromSelectors(selectors) {
+        var found = [];
+        for (var i = 0; i < selectors.length; i++) {
+          var selector = selectors[i];
+          var nodeList = targetDocument.querySelectorAll(selector);
+          for (var j = 0; j < nodeList.length; j++) {
+            var el = nodeList[j];
+            if (el && el.textContent && el.textContent.trim().length > 0 && isLikelyCaptionElement(el)) {
+              found.push(el);
+            }
+          }
+        }
+        return keepLeafCaptionElements(found);
+      }
+
+      var elements = collectFromSelectors(primaryCaptionSelectors);
+      if (elements.length > 0) return elements;
+
+      elements = collectFromSelectors(fallbackCaptionSelectors);
+      if (elements.length > 0) return elements;
+
+      // Last resort: Tactiq-style DOM read of the visible caption bubble.
+      // Zoom builds change class names often, so scan visible text nodes in
+      // the lower meeting stage instead of trusting class names only.
+      var all = targetDocument.body ? targetDocument.body.querySelectorAll('*') : [];
+      var geometricMatches = [];
+      for (var a = 0; a < all.length; a++) {
+        var candidate = all[a];
+        if (candidate && candidate.children && candidate.children.length > 8) continue;
+        if (candidate && candidate.textContent && candidate.textContent.trim().length > 0 && isLikelyCaptionElement(candidate)) {
+          geometricMatches.push(candidate);
+        }
+      }
+      return keepLeafCaptionElements(geometricMatches);
     }
 
     // Polling approach with deduplication
@@ -230,7 +351,7 @@
 
   function findCaptionsButton() {
     // Look for the captions/transcription toggle button
-    var buttonSelectors = [
+    var directButtonSelectors = [
       // Common Zoom button patterns
       'button[aria-label*="Caption" i]',
       'button[aria-label*="Subtitle" i]',
@@ -243,15 +364,17 @@
       '[data-testid*="caption-button"]',
       '[data-testid*="transcription-button"]',
       '.btn-text-popup-caption',
-      '.zm-btn-captioning',
+      '.zm-btn-captioning'
+    ];
+    var menuButtonSelectors = [
       // More/options menu (usually has caption option)
       'button[aria-label*="More" i]:not([aria-label*="Search"])',
       'button[aria-label*="Options" i]',
       '[data-testid*="more-actions"]'
     ];
 
-    for (var i = 0; i < buttonSelectors.length; i++) {
-      var btns = document.querySelectorAll(buttonSelectors[i]);
+    for (var i = 0; i < directButtonSelectors.length; i++) {
+      var btns = getZoomDocument().querySelectorAll(directButtonSelectors[i]);
       for (var j = 0; j < btns.length; j++) {
         var btn = btns[j];
         if (btn && btn.offsetParent !== null) { // Visible check
@@ -262,6 +385,14 @@
         }
       }
     }
+
+    for (var m = 0; m < menuButtonSelectors.length; m++) {
+      var menuBtns = getZoomDocument().querySelectorAll(menuButtonSelectors[m]);
+      for (var n = 0; n < menuBtns.length; n++) {
+        if (menuBtns[n] && menuBtns[n].offsetParent !== null) return menuBtns[n];
+      }
+    }
+
     return null;
   }
 
@@ -277,14 +408,25 @@
     ];
 
     var allMenuItems = [];
+    var targetDocument = getZoomDocument();
     for (var i = 0; i < menuItemSelectors.length; i++) {
-      var items = document.querySelectorAll(menuItemSelectors[i]);
+      var items = targetDocument.querySelectorAll(menuItemSelectors[i]);
       for (var j = 0; j < items.length; j++) {
         allMenuItems.push(items[j]);
       }
     }
 
-    var keywords = ['start transcription', 'enable transcription', 'show captions', 'enable captions', 'turn on caption'];
+    var keywords = [
+      'start transcription',
+      'enable transcription',
+      'show captions',
+      'show caption',
+      'show subtitle',
+      'enable captions',
+      'enable caption',
+      'turn on caption',
+      'closed caption'
+    ];
     for (var k = 0; k < allMenuItems.length; k++) {
       var item = allMenuItems[k];
       if (item && item.offsetParent !== null) { // Visible check
@@ -301,7 +443,7 @@
 
   function isTranscriptionActive() {
     // Check if transcription is currently running
-    var statusIndicators = document.querySelectorAll('[aria-label*="transcription" i], [class*="transcription-on"], [aria-pressed="true"]');
+    var statusIndicators = getZoomDocument().querySelectorAll('[aria-label*="transcription" i], [class*="transcription-on"], [aria-pressed="true"]');
     for (var i = 0; i < statusIndicators.length; i++) {
       if (statusIndicators[i].textContent.toLowerCase().includes('stop')) {
         return true;
@@ -341,6 +483,45 @@
     }
   }
 
+  function requestStartTranscription(reason) {
+    log('start-transcription:attempt', { reason: reason || 'manual' });
+    var captionBtn = findCaptionsButton();
+
+    if (!captionBtn) {
+      err('start-transcription:button-not-found');
+      return false;
+    }
+
+    dbg('start-transcription:button-found', { buttonText: captionBtn.textContent.substring(0, 30) });
+
+    try {
+      var label = captionBtn.getAttribute('aria-label') || captionBtn.getAttribute('title') || captionBtn.textContent || '';
+      if (/hide captions?|stop transcription|disable captions?|turn off captions?/i.test(label)) {
+        dbg('start-transcription:already-active-skip-toggle', { label: label.substring(0, 60) });
+        return true;
+      }
+
+      captionBtn.click();
+      log('start-transcription:button-clicked');
+
+      setTimeout(function () {
+        var menuItem = findStartTranscriptionMenuItem();
+        if (menuItem) {
+          dbg('start-transcription:menu-item-found', { text: menuItem.textContent.substring(0, 50) });
+          menuItem.click();
+          log('start-transcription:menu-item-clicked');
+        } else {
+          warn('start-transcription:menu-item-not-found');
+        }
+      }, 300);
+
+      return true;
+    } catch (e) {
+      err('start-transcription:click-error', e && e.message);
+      return false;
+    }
+  }
+
   // ═════════════════════════════════════════════════════════════════
   // 3. PUBLIC API FOR CONTENT SCRIPT
   // ═════════════════════════════════════════════════════════════════
@@ -353,40 +534,7 @@
     },
 
     startTranscription: function () {
-      log('start-transcription:attempt');
-      var captionBtn = findCaptionsButton();
-
-      if (!captionBtn) {
-        err('start-transcription:button-not-found');
-        return false;
-      }
-
-      dbg('start-transcription:button-found', { buttonText: captionBtn.textContent.substring(0, 30) });
-
-      // Click the button
-      try {
-        captionBtn.click();
-        log('start-transcription:button-clicked');
-
-        // Wait for menu to appear (100-500ms) then click "Start transcription"
-        setTimeout(function () {
-          var menuItem = findStartTranscriptionMenuItem();
-          if (menuItem) {
-            dbg('start-transcription:menu-item-found', { text: menuItem.textContent.substring(0, 50) });
-            menuItem.click();
-            log('start-transcription:menu-item-clicked');
-            return true;
-          } else {
-            warn('start-transcription:menu-item-not-found');
-            return false;
-          }
-        }, 300);
-
-        return true;
-      } catch (e) {
-        err('start-transcription:click-error', e && e.message);
-        return false;
-      }
+      return requestStartTranscription('api');
     },
 
     getTranscriptionStatus: function () {
@@ -398,7 +546,7 @@
       return {
         platform: 'zoom',
         captionButtonFound: !!findCaptionsButton(),
-        captionElementFound: !!document.querySelector('#live-transcription-subtitle, .live-transcription-subtitle__box'),
+        captionElementFound: !!getZoomDocument().querySelector('#live-transcription-subtitle, .live-transcription-subtitle__box'),
         transcriptionActive: isTranscriptionActive(),
         menuItemVisible: !!findStartTranscriptionMenuItem(),
         timestamp: Date.now()
@@ -411,7 +559,19 @@
   // ═════════════════════════════════════════════════════════════════
 
   // Start periodic status checks
+  startCaptionMonitor();
   setInterval(checkTranscriptionStatus, transcriptionState.checkInterval);
+
+  document.addEventListener('__mt_zoom_command', function (evt) {
+    var detail = evt.detail || {};
+    if (detail.command === 'startCaptionMonitoring') {
+      startCaptionMonitor();
+      return;
+    }
+    if (detail.command === 'ensureTranscription') {
+      requestStartTranscription(detail.reason || 'content-command');
+    }
+  });
 
   // Log available Zoom handlers
   dbg('zoom-apis-discovered', {
