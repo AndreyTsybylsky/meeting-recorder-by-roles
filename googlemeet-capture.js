@@ -11,6 +11,7 @@
 // Dispatches to document:
 //   CustomEvent('__mt_meet_caption', { detail: { deviceId, messageId, messageVersion, text } })
 //   CustomEvent('__mt_meet_device',  { detail: { deviceId, deviceName } })
+//   CustomEvent('__mt_meet_channel_state', { detail: { label, state, readyState, pcState } })
 //
 // The content script (ISOLATED world) listens for these events and
 // updates the transcript — even when the caption panel is closed.
@@ -448,6 +449,18 @@
     document.dispatchEvent(new CustomEvent('__mt_meet_device', { detail: info }));
   }
 
+  function dispatchChannelState(label, state, channel, pc) {
+    document.dispatchEvent(new CustomEvent('__mt_meet_channel_state', {
+      detail: {
+        label: label,
+        state: state,
+        readyState: channel && channel.readyState ? channel.readyState : 'unknown',
+        pcState: pc && pc.connectionState ? pc.connectionState : 'unknown',
+        timestamp: Date.now()
+      }
+    }));
+  }
+
   // ── RTCPeerConnection intercept (Tactiq pattern) ─────────────
   // KEY INSIGHT (from Tactiq source):
   //   Meet's 'captions' DataChannel is CLIENT-created, not server-created.
@@ -533,15 +546,18 @@
 
       ch.addEventListener('open', function () {
         log('captions-channel-open', { readyState: ch.readyState });
+        dispatchChannelState('captions', 'open', ch, pc);
       });
 
       ch.addEventListener('close', function () {
         warn('captions-channel-close', { readyState: ch.readyState });
+        dispatchChannelState('captions', 'close', ch, pc);
         if (activeCaptionsChannel === ch) activeCaptionsChannel = null;
       });
 
       ch.addEventListener('error', function (evt) {
         err('captions-channel-error', evt && evt.error ? evt.error : evt);
+        dispatchChannelState('captions', 'error', ch, pc);
       });
 
       // Listen for caption messages on this channel

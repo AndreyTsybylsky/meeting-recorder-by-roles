@@ -87,7 +87,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     
     return true; // async response
   }
-  
+
   if (message.type === 'DELETE_SESSION') {
     bgLog('DELETE_SESSION:start', { sessionId: message.sessionId });
     chrome.storage.local.get(['sessions'], (res) => {

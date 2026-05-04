@@ -1,0 +1,7 @@
+- iframe [ref=e5]:
+  - generic [active] [ref=f3e1]:
+    - generic [ref=f3e3]:
+      - img "loading..." [ref=f3e4]
+      - generic [ref=f3e5]: Joining Meeting...
+    - generic:
+      - alert

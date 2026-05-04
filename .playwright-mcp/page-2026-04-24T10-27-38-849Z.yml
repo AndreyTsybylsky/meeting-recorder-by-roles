@@ -1,0 +1,84 @@
+- generic [ref=e1]:
+  - generic [ref=e2]:
+    - generic [ref=e9]:
+      - generic [ref=e10]:
+        - link "Вернуться на главный экран" [ref=e13] [cursor=pointer]:
+          - /url: ""
+          - img "Вернуться на главный экран" [ref=e14]
+        - generic [ref=e18]:
+          - generic "Andrew Tsybulski" [ref=e19]: andrew.tsibylski@gmail.com
+          - link "Сменить аккаунт" [ref=e20] [cursor=pointer]:
+            - /url: https://accounts.google.com/AccountChooser?continue=https://meet.google.com/yio-waxs-opu?authuser%3D0%26pli%3D1&hl=ru
+      - generic [ref=e23]:
+        - generic [ref=e24]:
+          - generic [ref=e26]:
+            - generic [ref=e27]:
+              - generic:
+                - status "Предварительный просмотр видео включен"
+            - generic [ref=e34]: Andrew Tsybulski
+            - generic [ref=e39]:
+              - button "Ещё" [ref=e40] [cursor=pointer]:
+                - generic [ref=e42]: more_vert
+              - tooltip [ref=e44]: Ещё
+            - generic [ref=e45]:
+              - button "Подробнее о проблеме с микрофоном" [ref=e49] [cursor=pointer]:
+                - generic [ref=e52]:
+                  - img [ref=e53]
+                  - img [ref=e57]
+              - button "Подробнее о проблеме с камерой" [ref=e63] [cursor=pointer]:
+                - generic [ref=e66]:
+                  - img [ref=e67]
+                  - img [ref=e71]
+            - button "Фон и эффекты" [ref=e74] [cursor=pointer]:
+              - generic [ref=e77]: visual_effects
+          - generic [ref=e88]:
+            - 'button "Динамик: Динамик не найден." [ref=e90] [cursor=pointer]':
+              - img [ref=e95]
+              - generic [ref=e99]: Динамик не найден.
+              - img [ref=e101]
+            - tooltip [ref=e104]
+        - generic [ref=e107]:
+          - heading "Готовы присоединиться?" [level=1] [ref=e111]:
+            - generic [ref=e113]:
+              - generic [ref=e114]: Готовы присоединиться?
+              - tooltip [ref=e115]: Готовы присоединиться?
+          - generic [ref=e116]:
+            - generic [ref=e120]:
+              - button "Gemini может вести заметки Поделиться заметками и расшифровкой" [ref=e121] [cursor=pointer]
+              - generic [ref=e123]:
+                - generic [ref=e125]: pen_spark
+                - generic [ref=e126]:
+                  - generic [ref=e127]: Gemini может вести заметки
+                  - generic [ref=e128]: Поделиться заметками и расшифровкой
+                - button "Начать" [ref=e130] [cursor=pointer]:
+                  - generic [ref=e132]: Начать
+            - generic [ref=e136]:
+              - button "Присоединиться" [active] [ref=e138] [cursor=pointer]:
+                - generic [ref=e140]: Присоединиться
+              - tooltip [ref=e141]
+            - button "Другие способы присоединиться" [ref=e144] [cursor=pointer]:
+              - generic [ref=e146]: Другие способы присоединиться
+              - generic [ref=e148]: expand_more
+      - contentinfo [ref=e151]:
+        - generic [ref=e152]:
+          - generic [ref=e153]: spark
+          - generic [ref=e154]:
+            - text: Gemini в Meet может помогать как ваш личный ассистент. ИИ анализирует обсуждение, получая на время доступ к субтитрам. При использовании функции "Спросить Gemini" запись не создается и данные не хранятся после встречи. Организатор может выключить функцию.
+            - link "Подробнее" [ref=e155] [cursor=pointer]:
+              - /url: https://support.google.com/meet?p=privacy&hl=ru
+    - dialog "Хотите, чтобы другие участники встречи видели и слышали вас?" [ref=e157]:
+      - generic [ref=e160]:
+        - img "Люди, использующие Meet." [ref=e162]
+        - generic [ref=e163]:
+          - heading "Хотите, чтобы другие участники встречи видели и слышали вас?" [level=1] [ref=e164]
+          - generic [ref=e165]: В любой момент встречи микрофон и камеру можно отключить.
+          - generic [ref=e170]:
+            - button "Ещё" [ref=e171] [cursor=pointer]:
+              - generic [ref=e173]: expand_more
+            - tooltip [ref=e175]: Ещё
+          - button "Продолжить с отключенными микрофоном и камерой" [ref=e177] [cursor=pointer]:
+            - generic [ref=e179]: Продолжить с отключенными микрофоном и камерой
+  - iframe [ref=e183]:
+    - generic [ref=f1e6]:
+      - text: защита от спама
+      - strong [ref=f1e7]: reCAPTCHA

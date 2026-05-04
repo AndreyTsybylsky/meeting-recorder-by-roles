@@ -171,6 +171,67 @@
       color: #475569;
       margin-top: 2px;
     }
+    .sidebar-input {
+      width: 100%;
+      margin-top: 6px;
+      padding: 6px 8px;
+      border-radius: 8px;
+      border: 1px solid rgba(255,255,255,.08);
+      background: rgba(255,255,255,.03);
+      color: #cbd5e1;
+      font-size: 11px;
+      font-family: 'Inter', sans-serif;
+    }
+    .sidebar-input::placeholder {
+      color: #64748b;
+    }
+    .sidebar-inline-fields {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      margin-top: 6px;
+    }
+    .sidebar-status-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-top: 6px;
+    }
+    .sidebar-status-text {
+      font-size: 11px;
+      color: #cbd5e1;
+    }
+    .sidebar-status-hint {
+      margin-top: 4px;
+      font-size: 10px;
+      color: #64748b;
+      line-height: 1.4;
+    }
+    .sidebar-advanced {
+      margin-top: 8px;
+    }
+    .sidebar-advanced summary {
+      cursor: pointer;
+      font-size: 11px;
+      color: #94a3b8;
+      user-select: none;
+    }
+    .sidebar-inline-button {
+      padding: 6px 10px;
+      border: 1px solid rgba(255,255,255,.08);
+      border-radius: 8px;
+      background: rgba(255,255,255,.06);
+      color: #cbd5e1;
+      font-family: 'Inter', sans-serif;
+      font-size: 11px;
+      cursor: pointer;
+      flex-shrink: 0;
+    }
+    .sidebar-inline-button:disabled {
+      opacity: .55;
+      cursor: default;
+    }
     /* Toggle switch */
     .sw {
       position: relative;
@@ -503,6 +564,17 @@
     </div>
     <label class="sw">
       <input type="checkbox" id="autoRecordToggle">
+      <span class="sw-slider"></span>
+    </label>
+  </div>
+
+  <div class="sidebar-row">
+    <div>
+      <div class="sidebar-row-label">Buzz Quality Mode</div>
+      <div class="sidebar-row-hint">Фильтрация шумных/нестабильных фраз в live-режиме</div>
+    </div>
+    <label class="sw">
+      <input type="checkbox" id="qualityFusionToggle">
       <span class="sw-slider"></span>
     </label>
   </div>

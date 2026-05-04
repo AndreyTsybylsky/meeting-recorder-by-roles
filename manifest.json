@@ -8,6 +8,14 @@
     "tabs",
     "downloads"
   ],
+  "host_permissions": [
+    "*://meet.google.com/*",
+    "*://teams.microsoft.com/*",
+    "*://teams.live.com/*",
+    "*://teams.cloud.microsoft/*",
+    "*://zoom.us/*",
+    "*://*.zoom.us/*"
+  ],
   "background": {
     "service_worker": "background.js"
   },

@@ -27,13 +27,22 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // Auto-record toggle (default ON — value is true when key absent)
   const autoRecordToggle = document.getElementById('autoRecordToggle');
+  const qualityFusionToggle = document.getElementById('qualityFusionToggle');
 
   chrome.storage.local.get(['autoRecordEnabled'], (res) => {
     autoRecordToggle.checked = res.autoRecordEnabled !== undefined ? !!res.autoRecordEnabled : true;
   });
 
+  chrome.storage.local.get(['qualityFusionEnabled'], (res) => {
+    qualityFusionToggle.checked = res.qualityFusionEnabled !== undefined ? !!res.qualityFusionEnabled : true;
+  });
+
   autoRecordToggle.addEventListener('change', () => {
     chrome.storage.local.set({ autoRecordEnabled: autoRecordToggle.checked });
+  });
+
+  qualityFusionToggle.addEventListener('change', () => {
+    chrome.storage.local.set({ qualityFusionEnabled: qualityFusionToggle.checked });
   });
 
   // ── Quick-record logic ──────────────────────────────────

@@ -185,11 +185,15 @@ function destroyWidget() {
 
 let isRecording = false;
 let transcript = []; // Array of { id: string, name: string, text: string }
+let captionBuffer = [];
 let currentSessionId = null;
 let storageStateInitialized = false;
 let storageStateTouchedLocally = false;
 let sidebarEnabled = false;    // off by default for stealth; user enables via popup
 let autoRecordEnabled = true;  // record automatically on join; user can disable via popup
+let qualityFusionEnabled = true; // Buzz-inspired live quality heuristics
+let minCaptionChars = 6; // Skip tiny noisy fragments
+let hideUnconfirmedEnabled = true; // Hide unstable short interim-looking fragments
 let meetCaptionOverlayHidden = true; // Tactiq-like default: capture continues while native overlay is hidden
 let meetTryEnableCaptionsOnStart = false; // Optional bootstrap: try enabling captions once on recording start
 let meetCaptionBootstrapAttemptedForSession = false;
@@ -197,11 +201,71 @@ let meetCaptionBootstrapTimer = null;
 let meetCaptionManualVisible = false;
 let meetCaptionEnabledByBootstrap = false;
 let suppressNextMeetCaptionToggleClick = false;
+let zoomLastCaptionActivityAt = 0;
+let zoomLastEnsureTranscriptionAt = 0;
 // Guard: only trigger "meeting ended" detection after the meeting container has been
 // seen at least once. Prevents false-positive stopAndSave() on initial page load
 // before the meeting UI finishes rendering (Teams SPA issue).
 let meetingContainerEverSeen = false;
 let meetingUiMissingStreak = 0;
+
+const MAX_STREAM_BUFFER_ITEMS = 500;
+
+function trimStreamBuffer(buffer) {
+  if (!Array.isArray(buffer)) return;
+  if (buffer.length > MAX_STREAM_BUFFER_ITEMS) {
+    buffer.splice(0, buffer.length - MAX_STREAM_BUFFER_ITEMS);
+  }
+}
+
+function resetStreamBuffers() {
+  captionBuffer = [];
+}
+
+function upsertCaptionBufferEvent(event) {
+  if (!event || !event.id || !event.text) return null;
+  const normalizedEvent = {
+    id: event.id,
+    source: event.source || 'captions',
+    startTs: Number.isFinite(Number(event.startTs)) ? Number(event.startTs) : Date.now(),
+    endTs: Number.isFinite(Number(event.endTs)) ? Number(event.endTs) : Date.now(),
+    speakerName: event.speakerName || 'Speaker',
+    text: event.text,
+    isFinal: event.isFinal !== undefined ? !!event.isFinal : true
+  };
+
+  const existingIndex = captionBuffer.findIndex((item) => item.id === normalizedEvent.id);
+  if (existingIndex >= 0) {
+    captionBuffer[existingIndex] = { ...captionBuffer[existingIndex], ...normalizedEvent };
+  } else {
+    captionBuffer.push(normalizedEvent);
+    trimStreamBuffer(captionBuffer);
+  }
+
+  return normalizedEvent;
+}
+
+function rebuildStreamBuffersFromTranscript() {
+  resetStreamBuffers();
+  transcript.forEach((item) => {
+    if (!item || !item.id || !item.text) return;
+    const timestamp = Number.isFinite(Number(item._timestamp)) ? Number(item._timestamp) : Date.now();
+    upsertCaptionBufferEvent({
+      id: item.id,
+      source: item._source || 'captions',
+      startTs: timestamp,
+      endTs: timestamp,
+      speakerName: item.name || 'Speaker',
+      text: item.text,
+      isFinal: true
+    });
+  });
+}
+
+function replaceTranscript(nextTranscript) {
+  transcript = Array.isArray(nextTranscript) ? nextTranscript : [];
+  rebuildStreamBuffersFromTranscript();
+}
 
 // Extract meeting code from URL
 function getMeetingCode() {
@@ -234,6 +298,7 @@ mtLog('platform-detected', {
 
 let memoizedMeetingTitle = null;
 let memoizedUserName = null;
+let lastSelfNameBackfillAt = 0;
 
 function cleanTitle(str) {
   if (!str) return str;
@@ -393,6 +458,178 @@ function sanitizeSpeechText(speakerName, speechText) {
   return normalizedText;
 }
 
+function isSystemCaptionNoise(text) {
+  if (!text) return false;
+  const patterns = [
+    /turned on live transcription/i,
+    /turned off live transcription/i,
+    /you have turned on/i,
+    /you have turned off/i,
+    /has joined/i,
+    /has left/i,
+    /recording has started/i,
+    /recording has stopped/i,
+    /new update available/i,
+    /local data storage/i,
+    /improve app performance/i,
+    /not recommended on public/i,
+    /clear data on logout/i,
+    /disableenable/i,
+    /weeklyupdate/i,
+    /zoom workplace/i,
+    /^alert$/i
+  ];
+  return patterns.some((rx) => rx.test(text));
+}
+
+function isLikelyUnconfirmedFragment(text) {
+  if (!text) return false;
+  if (/[.!?…]$/.test(text)) return false;
+  const words = text.split(/\s+/).filter(Boolean);
+  return words.length <= 3 && text.length < 24;
+}
+
+function applyLiveQualityFilters(text) {
+  if (!text) return '';
+  const normalized = text.replace(/\s+/g, ' ').trim();
+  if (!normalized) return '';
+  if (!qualityFusionEnabled) return normalized;
+  if (isSystemCaptionNoise(normalized)) return '';
+  if (normalized.length < Math.max(1, Number(minCaptionChars) || 1)) return '';
+  if (hideUnconfirmedEnabled && isLikelyUnconfirmedFragment(normalized)) return '';
+  return normalized;
+}
+
+function normalizeTranscriptTextForDedupe(text) {
+  return String(text || '')
+    .replace(/\s+/g, ' ')
+    .replace(/[.,!?;:]+$/g, '')
+    .trim()
+    .toLowerCase();
+}
+
+function normalizeSpeakerForDedupe(name) {
+  return String(name || '').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+function isSelfSpeakerAlias(name) {
+  const normalized = normalizeSpeakerForDedupe(name);
+  if (!normalized) return false;
+  if (normalized === 'you' || normalized === '\u0432\u044b') return true;
+  const realName = getUserRealName();
+  return !!realName && normalized === normalizeSpeakerForDedupe(realName);
+}
+
+function isSameSpeakerForDedupe(a, b) {
+  const left = normalizeSpeakerForDedupe(a);
+  const right = normalizeSpeakerForDedupe(b);
+  if (left && right && left === right) return true;
+  if (isSelfSpeakerAlias(a) && (isSelfSpeakerAlias(b) || isRealName(b))) return true;
+  if (isSelfSpeakerAlias(b) && (isSelfSpeakerAlias(a) || isRealName(a))) return true;
+  return false;
+}
+
+function isSameLiveCaptionText(a, b) {
+  const left = normalizeTranscriptTextForDedupe(a);
+  const right = normalizeTranscriptTextForDedupe(b);
+  if (!left || !right) return false;
+  if (left === right) return true;
+  if (Math.min(left.length, right.length) < 35) return false;
+  return left.startsWith(right) || right.startsWith(left);
+}
+
+function findDuplicateCaptionEntry(text, speakerName, excludeId) {
+  for (let i = transcript.length - 1; i >= 0; i--) {
+    const entry = transcript[i];
+    if (!entry || entry.id === excludeId || !entry.text) continue;
+    if (!isSameSpeakerForDedupe(entry.name, speakerName)) continue;
+    if (isSameLiveCaptionText(entry.text, text)) return entry;
+  }
+  return null;
+}
+
+function preferCaptionName(currentName, nextName) {
+  if (!nextName) return currentName || 'Speaker';
+  if (!currentName || currentName === 'Speaker') return nextName;
+  if (isSelfSpeakerAlias(currentName) && !/^(you|\u0432\u044b)$/i.test(normalizeSpeakerForDedupe(nextName))) {
+    return nextName;
+  }
+  return currentName;
+}
+
+function mergeDuplicateCaptionEntry(existing, next) {
+  if (!existing || !next || !next.text) return false;
+  const nextText = next.text;
+  const shouldReplaceText = normalizeTranscriptTextForDedupe(nextText).length > normalizeTranscriptTextForDedupe(existing.text).length;
+  const nextName = preferCaptionName(existing.name, next.name);
+  let changed = false;
+
+  if ((existing._selfUnresolved || isSelfPlaceholderName(existing.name)) && nextName && !isSelfPlaceholderName(nextName)) {
+    rememberUserRealName(nextName, 'dedupe-matching-caption');
+  }
+
+  if (shouldReplaceText && existing.text !== nextText) {
+    existing.text = nextText;
+    changed = true;
+  }
+
+  if (nextName && existing.name !== nextName) {
+    existing.name = nextName;
+    changed = true;
+  }
+
+  if (next.source && !existing._source) {
+    existing._source = next.source;
+  }
+  if (Number.isFinite(Number(next.rtcVersion))) {
+    existing._rtcVersion = Math.max(Number(existing._rtcVersion) || 0, Number(next.rtcVersion));
+  }
+  existing._selfUnresolved = false;
+
+  if (changed) {
+    upsertCaptionBufferEvent({
+      id: existing.id,
+      source: existing._source || next.source || 'captions',
+      speakerName: existing.name,
+      text: existing.text,
+      isFinal: true
+    });
+  }
+
+  return changed;
+}
+
+function compactDuplicateCaptionEntries() {
+  let removed = 0;
+  for (let i = 0; i < transcript.length; i++) {
+    const base = transcript[i];
+    if (!base) continue;
+    for (let j = i + 1; j < transcript.length; j++) {
+      const candidate = transcript[j];
+      if (!candidate) continue;
+      if (!isSameSpeakerForDedupe(base.name, candidate.name)) continue;
+      if (!isSameLiveCaptionText(base.text, candidate.text)) continue;
+      mergeDuplicateCaptionEntry(base, {
+        name: candidate.name,
+        text: candidate.text,
+        source: candidate._source || 'captions',
+        rtcVersion: candidate._rtcVersion
+      });
+      transcript.splice(j, 1);
+      removed++;
+      j--;
+    }
+  }
+  if (removed > 0) {
+    rebuildStreamBuffersFromTranscript();
+    mtWarn('transcript-dedupe:compacted', {
+      removed: removed,
+      transcriptLength: transcript.length
+    });
+  }
+  return removed;
+}
+
 function sanitizeZoomSpeechText(speechText) {
   if (!speechText) return '';
 
@@ -411,11 +648,14 @@ function sanitizeZoomSpeechText(speechText) {
   const normalized = lines.join(' ').trim();
   // Guard against picking full-page text when a selector is too broad.
   if (normalized.length > 260) return '';
+  if (/^[A-ZА-ЯЁ]\s+\S+/.test(normalized)) {
+    return normalized.replace(/^[A-ZА-ЯЁ]\s+/, '').trim();
+  }
   return normalized;
 }
 
 function getZoomActiveSpeakerName() {
-  const iframe = document.querySelector('iframe');
+  const iframe = document.querySelector('#webclient') || document.querySelector('iframe');
   const doc = iframe && iframe.contentDocument ? iframe.contentDocument : document;
   const candidates = [
     doc.querySelector('.speaker-active-container__wrap'),
@@ -434,12 +674,18 @@ function getZoomActiveSpeakerName() {
 
 function getCaptionObservationRoot() {
   if (PLATFORM === 'zoom') {
-    const iframe = document.querySelector('iframe');
+    const iframe = document.querySelector('#webclient') || document.querySelector('iframe');
     const doc = iframe && iframe.contentDocument ? iframe.contentDocument : null;
     if (doc && doc.body) return doc.body;
   }
 
   return document.body;
+}
+
+function getZoomWebclientDocument() {
+  if (PLATFORM !== 'zoom') return document;
+  const iframe = document.querySelector('#webclient') || document.querySelector('iframe');
+  return iframe && iframe.contentDocument ? iframe.contentDocument : document;
 }
 
 function getUserRealName() {
@@ -489,6 +735,105 @@ function getUserRealName() {
   }
 
   return null;
+}
+
+function isSelfPlaceholderName(name) {
+  const normalized = normalizeSpeakerForDedupe(name);
+  return normalized === 'you' || normalized === '\u0432\u044b';
+}
+
+function rememberUserRealName(name, source) {
+  const cleanName = String(name || '').replace(/\s+/g, ' ').trim();
+  if (!cleanName || cleanName === 'Speaker' || !isRealName(cleanName) || isSelfPlaceholderName(cleanName)) return false;
+
+  const normalized = normalizeSpeakerForDedupe(cleanName);
+  if (memoizedUserName) {
+    return normalizeSpeakerForDedupe(memoizedUserName) === normalized;
+  }
+
+  memoizedUserName = cleanName;
+  mtLog('speaker-name:remembered-self', {
+    source: source || 'unknown',
+    realName: memoizedUserName
+  });
+  return true;
+}
+
+function rememberUserRealNameFromMatchingSelfCaption(name, text, source) {
+  if (memoizedUserName) return false;
+
+  const hasMatchingSelfCaption = transcript.some((entry) => {
+    if (!entry || !entry.text) return false;
+    if (!entry._selfUnresolved && !isSelfPlaceholderName(entry.name)) return false;
+    return isSameLiveCaptionText(entry.text, text);
+  });
+
+  if (!hasMatchingSelfCaption) return false;
+  return rememberUserRealName(name, source);
+}
+
+function discoverSelfNameFromTranscript() {
+  if (memoizedUserName) return memoizedUserName;
+
+  const hasUnresolvedSelf = transcript.some((entry) =>
+    entry && (entry._selfUnresolved || isSelfPlaceholderName(entry.name))
+  );
+  if (!hasUnresolvedSelf) return null;
+
+  const realNames = new Map();
+  transcript.forEach((entry) => {
+    if (!entry || !entry.name) return;
+    const name = String(entry.name).replace(/\s+/g, ' ').trim();
+    if (!name || name === 'Speaker' || isSelfPlaceholderName(name) || !isRealName(name)) return;
+    realNames.set(normalizeSpeakerForDedupe(name), name);
+  });
+
+  if (realNames.size !== 1) return null;
+  const onlyName = Array.from(realNames.values())[0];
+  rememberUserRealName(onlyName, 'transcript-single-real-speaker');
+  return memoizedUserName;
+}
+
+function backfillSelfSpeakerName() {
+  const realName = getUserRealName() || discoverSelfNameFromTranscript();
+  if (!realName) return 0;
+
+  let patched = 0;
+  transcript.forEach((entry) => {
+    if (!entry || (!entry._selfUnresolved && !isSelfPlaceholderName(entry.name))) return;
+    entry.name = realName;
+    entry._selfUnresolved = false;
+    upsertCaptionBufferEvent({
+      id: entry.id,
+      source: entry._source || 'captions',
+      speakerName: realName,
+      text: entry.text,
+      isFinal: true
+    });
+    patched++;
+  });
+
+  if (patched > 0) {
+    mtLog('speaker-name:backfilled-self', {
+      realName,
+      patched
+    });
+  }
+  return patched;
+}
+
+function applySelfSpeakerNameBackfill(options) {
+  const patched = backfillSelfSpeakerName();
+  if (patched <= 0) return 0;
+
+  compactDuplicateCaptionEntries();
+  if (options && options.persist) {
+    safeStorageSet({ [TRANSCRIPT_STORAGE_KEY]: transcript });
+  }
+  if (options && options.refresh) {
+    refreshUI();
+  }
+  return patched;
 }
 
 const STORAGE_SCOPE = `${PLATFORM}:${getMeetingCode()}`;
@@ -604,7 +949,19 @@ function setScopedRecordingState(nextIsRecording, nextTranscript) {
 }
 
 // ── Persistence ─────────────────────────────────────────────
-safeStorageGet([RECORDING_STORAGE_KEY, TRANSCRIPT_STORAGE_KEY, 'isRecording', 'transcript', 'sidebarEnabled', 'autoRecordEnabled', 'meetCaptionOverlayHidden', 'meetTryEnableCaptionsOnStart'], (res) => {
+safeStorageGet([
+  RECORDING_STORAGE_KEY,
+  TRANSCRIPT_STORAGE_KEY,
+  'isRecording',
+  'transcript',
+  'sidebarEnabled',
+  'autoRecordEnabled',
+  'meetCaptionOverlayHidden',
+  'meetTryEnableCaptionsOnStart',
+  'qualityFusionEnabled',
+  'minCaptionChars',
+  'hideUnconfirmedEnabled'
+], (res) => {
   const scopedIsRecording = res[RECORDING_STORAGE_KEY];
   const scopedTranscript = res[TRANSCRIPT_STORAGE_KEY];
 
@@ -615,6 +972,9 @@ safeStorageGet([RECORDING_STORAGE_KEY, TRANSCRIPT_STORAGE_KEY, 'isRecording', 't
     legacyTranscriptLength: Array.isArray(res.transcript) ? res.transcript.length : -1,
     sidebarEnabled: res.sidebarEnabled,
     autoRecordEnabled: res.autoRecordEnabled,
+    qualityFusionEnabled: res.qualityFusionEnabled,
+    minCaptionChars: res.minCaptionChars,
+    hideUnconfirmedEnabled: res.hideUnconfirmedEnabled,
     meetCaptionOverlayHidden: res.meetCaptionOverlayHidden,
     meetTryEnableCaptionsOnStart: res.meetTryEnableCaptionsOnStart
   });
@@ -625,6 +985,9 @@ safeStorageGet([RECORDING_STORAGE_KEY, TRANSCRIPT_STORAGE_KEY, 'isRecording', 't
   if (res.sidebarEnabled !== undefined) {
     sidebarEnabled = !!res.sidebarEnabled;
   }
+  qualityFusionEnabled = res.qualityFusionEnabled !== undefined ? !!res.qualityFusionEnabled : true;
+  minCaptionChars = Number.isFinite(Number(res.minCaptionChars)) ? Math.max(1, Math.min(40, Number(res.minCaptionChars))) : 6;
+  hideUnconfirmedEnabled = res.hideUnconfirmedEnabled !== undefined ? !!res.hideUnconfirmedEnabled : true;
   meetCaptionOverlayHidden = res.meetCaptionOverlayHidden !== undefined
     ? !!res.meetCaptionOverlayHidden
     : true;
@@ -647,7 +1010,7 @@ safeStorageGet([RECORDING_STORAGE_KEY, TRANSCRIPT_STORAGE_KEY, 'isRecording', 't
       // Auto-start: fresh join OR rejoining after a previous session was stopped.
       isRecording = true;
       currentSessionId = Date.now().toString();
-      transcript = [];
+      replaceTranscript([]);
       meetCaptionManualVisible = false;
       meetCaptionEnabledByBootstrap = false;
       meetCaptionBootstrapAttemptedForSession = false;
@@ -656,15 +1019,16 @@ safeStorageGet([RECORDING_STORAGE_KEY, TRANSCRIPT_STORAGE_KEY, 'isRecording', 't
       setScopedRecordingState(true, []);
       mtLog('storage-init:auto-start-enabled', { sessionId: currentSessionId });
       tryEnableMeetCaptionsOnRecordingStart('auto-start');
+      tryEnableZoomTranscriptionOnRecordingStart('auto-start');
     }
 
     // Always restore transcript from storage, regardless of autoRecordEnabled status.
     // This ensures the user's previous transcripts are never lost.
     if (Array.isArray(scopedTranscript)) {
-      transcript = scopedTranscript;
+      replaceTranscript(scopedTranscript);
       mtLog('storage-init:restored-scoped-transcript', { length: transcript.length });
     } else if (Array.isArray(res.transcript)) {
-      transcript = res.transcript;
+      replaceTranscript(res.transcript);
       safeStorageSet({ [TRANSCRIPT_STORAGE_KEY]: transcript });
       mtLog('storage-init:migrated-legacy-transcript', { length: transcript.length });
     }
@@ -676,9 +1040,15 @@ safeStorageGet([RECORDING_STORAGE_KEY, TRANSCRIPT_STORAGE_KEY, 'isRecording', 't
     transcriptLength: transcript.length,
     sidebarEnabled: sidebarEnabled,
     autoRecordEnabled: autoRecordEnabled,
+    qualityFusionEnabled: qualityFusionEnabled,
+    minCaptionChars: minCaptionChars,
+    hideUnconfirmedEnabled: hideUnconfirmedEnabled,
     meetCaptionOverlayHidden: meetCaptionOverlayHidden,
     meetTryEnableCaptionsOnStart: meetTryEnableCaptionsOnStart
   });
+  if (isRecording) {
+    tryEnableZoomTranscriptionOnRecordingStart('storage-init');
+  }
   refreshUI();
 });
 
@@ -690,9 +1060,10 @@ if (isExtensionContextAvailable()) {
         if (changes[RECORDING_STORAGE_KEY] !== undefined) {
           isRecording = changes[RECORDING_STORAGE_KEY].newValue;
           mtLog('storage.onChanged:recording', { isRecording: isRecording });
+          syncZoomCaptionHideStyle();
         }
         if (changes[TRANSCRIPT_STORAGE_KEY] !== undefined) {
-          transcript = changes[TRANSCRIPT_STORAGE_KEY].newValue;
+          replaceTranscript(changes[TRANSCRIPT_STORAGE_KEY].newValue);
           mtLog('storage.onChanged:transcript', { length: Array.isArray(transcript) ? transcript.length : -1 });
         }
         if (changes['sidebarEnabled'] !== undefined) {
@@ -703,9 +1074,22 @@ if (isExtensionContextAvailable()) {
           autoRecordEnabled = !!changes['autoRecordEnabled'].newValue;
           mtLog('storage.onChanged:autoRecordEnabled', { autoRecordEnabled: autoRecordEnabled });
         }
+        if (changes['qualityFusionEnabled'] !== undefined) {
+          qualityFusionEnabled = !!changes['qualityFusionEnabled'].newValue;
+          mtLog('storage.onChanged:qualityFusionEnabled', { qualityFusionEnabled: qualityFusionEnabled });
+        }
+        if (changes['minCaptionChars'] !== undefined) {
+          minCaptionChars = Math.max(1, Math.min(40, Number(changes['minCaptionChars'].newValue) || 6));
+          mtLog('storage.onChanged:minCaptionChars', { minCaptionChars: minCaptionChars });
+        }
+        if (changes['hideUnconfirmedEnabled'] !== undefined) {
+          hideUnconfirmedEnabled = !!changes['hideUnconfirmedEnabled'].newValue;
+          mtLog('storage.onChanged:hideUnconfirmedEnabled', { hideUnconfirmedEnabled: hideUnconfirmedEnabled });
+        }
         if (changes['meetCaptionOverlayHidden'] !== undefined) {
           meetCaptionOverlayHidden = !!changes['meetCaptionOverlayHidden'].newValue;
           mtLog('storage.onChanged:meetCaptionOverlayHidden', { meetCaptionOverlayHidden: meetCaptionOverlayHidden });
+          syncZoomCaptionHideStyle();
         }
         if (changes['meetTryEnableCaptionsOnStart'] !== undefined) {
           meetTryEnableCaptionsOnStart = !!changes['meetTryEnableCaptionsOnStart'].newValue;
@@ -733,7 +1117,7 @@ if (isExtensionContextAvailable()) {
         isRecording = newState;
         if (isRecording) {
           currentSessionId = Date.now().toString();
-          transcript = [];
+          replaceTranscript([]);
           meetCaptionManualVisible = false;
           meetCaptionEnabledByBootstrap = false;
           meetCaptionBootstrapAttemptedForSession = false;
@@ -742,6 +1126,7 @@ if (isExtensionContextAvailable()) {
           setScopedRecordingState(true, []);
           mtLog('recording-start:manual-toggle', { sessionId: currentSessionId });
           tryEnableMeetCaptionsOnRecordingStart('manual-toggle');
+          tryEnableZoomTranscriptionOnRecordingStart('manual-toggle');
           // Close the transcript panel if the widget is already injected
           if (typeof window.__meetTranscriberSetPanelOpen === 'function') {
             window.__meetTranscriberSetPanelOpen(false);
@@ -749,7 +1134,7 @@ if (isExtensionContextAvailable()) {
         } else {
           mtWarn('recording-stop:manual-toggle', { transcriptLength: transcript.length });
           finalizeSession();
-          transcript = [];
+          replaceTranscript([]);
           meetCaptionManualVisible = false;
           meetCaptionEnabledByBootstrap = false;
           meetCaptionBootstrapAttemptedForSession = false;
@@ -757,6 +1142,9 @@ if (isExtensionContextAvailable()) {
           if (PLATFORM === 'meet') {
             removeMeetCaptionHideStyle();
             window.dispatchEvent(new Event('resize'));
+          }
+          if (PLATFORM === 'zoom') {
+            removeZoomCaptionHideStyle();
           }
           setScopedRecordingState(false, []);
           currentSessionId = null;
@@ -770,36 +1158,27 @@ if (isExtensionContextAvailable()) {
           sendResponse({ success: false, error: 'Not on Zoom' });
           return false;
         }
-        if (!window.__meetTranscriberZoomCaptureAPI) {
-          sendResponse({ success: false, error: 'Zoom capture API not ready' });
-          return false;
-        }
-        try {
-          const result = window.__meetTranscriberZoomCaptureAPI.startTranscription();
-          const status = window.__meetTranscriberZoomCaptureAPI.getTranscriptionStatus();
-          mtLog('start-zoom-transcription:requested', { result, status });
-          sendResponse({ success: result, status });
-          return false;
-        } catch (e) {
-          mtWarn('start-zoom-transcription:error', e && e.message);
-          sendResponse({ success: false, error: e && e.message ? e.message : 'Unknown error' });
-          return false;
-        }
+        dispatchZoomCaptureCommand('startCaptionMonitoring', 'popup-message');
+        dispatchZoomCaptureCommand('ensureTranscription', 'popup-message');
+        mtLog('start-zoom-transcription:requested');
+        sendResponse({ success: true });
+        return false;
       }
       if (message.type === 'GET_ZOOM_DEBUG_INFO') {
-        if (PLATFORM !== 'zoom' || !window.__meetTranscriberZoomCaptureAPI) {
+        if (PLATFORM !== 'zoom') {
           sendResponse({ info: null });
           return false;
         }
-        try {
-          const debugInfo = window.__meetTranscriberZoomCaptureAPI.debugInfo();
-          const status = window.__meetTranscriberZoomCaptureAPI.getTranscriptionStatus();
-          sendResponse({ info: { ...debugInfo, ...status } });
-          return false;
-        } catch (e) {
-          sendResponse({ info: null, error: e && e.message });
-          return false;
-        }
+        sendResponse({
+          info: {
+            platform: 'zoom',
+            captionElementFound: !!getZoomWebclientDocument().querySelector('#live-transcription-subtitle, .live-transcription-subtitle__box'),
+            lastCaptionActivityAgoMs: zoomLastCaptionActivityAt ? Date.now() - zoomLastCaptionActivityAt : null,
+            overlayHidden: meetCaptionOverlayHidden,
+            timestamp: Date.now()
+          }
+        });
+        return false;
       }
     });
   } catch (e) {
@@ -813,6 +1192,8 @@ function saveTranscript() {
   clearTimeout(saveTimeout);
   mtLog('saveTranscript:scheduled', { transcriptLength: transcript.length });
   saveTimeout = setTimeout(() => {
+    backfillSelfSpeakerName();
+    compactDuplicateCaptionEntries();
     mtLog('saveTranscript:flush', { transcriptLength: transcript.length });
     safeStorageSet({ [TRANSCRIPT_STORAGE_KEY]: transcript });
     refreshUI();
@@ -821,6 +1202,8 @@ function saveTranscript() {
 
 // ── Session Auto-Save ───────────────────────────────────────
 function finalizeSession() {
+  backfillSelfSpeakerName();
+  compactDuplicateCaptionEntries();
   mtLog('finalizeSession:start', {
     transcriptLength: transcript.length,
     currentSessionId: currentSessionId
@@ -876,13 +1259,15 @@ function finalizeSession() {
     title: fullTitle,
     date: new Date().toISOString(),
     phraseCount: transcript.length,
-    transcript: merged
+    transcript: merged,
+    debugStats: PLATFORM === 'meet' ? getMeetSourceStatsSnapshot() : undefined
   };
   mtLog('finalizeSession:prepared', {
     sessionId: session.id,
     phraseCount: session.phraseCount,
     meetingCode: session.meetingCode,
-    title: session.title
+    title: session.title,
+    sourceStats: session.debugStats
   });
   
   // Send to background for persistent storage, fallback to local list if messaging fails.
@@ -926,6 +1311,9 @@ function stopAndSave(reason) {
   if (PLATFORM === 'meet') {
     removeMeetCaptionHideStyle();
     window.dispatchEvent(new Event('resize'));
+  }
+  if (PLATFORM === 'zoom') {
+    removeZoomCaptionHideStyle();
   }
   mtWarn('stopAndSave:recording-stopped', { reason: reason || 'unspecified' });
   refreshUI();
@@ -1036,6 +1424,13 @@ setInterval(() => {
 const captionObserver = new MutationObserver((mutations) => {
   if (!isRecording) return;
 
+  // Zoom has a dedicated MAIN-world capture module (zoom-capture.js).
+  // The generic DOM observer sees reused subtitle nodes and tends to overwrite
+  // the latest line, so Zoom ingestion stays on the __mt_zoom_caption path.
+  if (PLATFORM === 'zoom') {
+    return;
+  }
+
   mtLog('mutation-observer:batch', { mutationCount: mutations.length });
 
   const captionConfig = getCaptionConfig();
@@ -1081,7 +1476,7 @@ const captionObserver = new MutationObserver((mutations) => {
       let speakerName = nameEl ? nameEl.textContent.trim() : "";
       
       // Resolve "You/Вы" or missing names to real name
-      const isUnresolvedSelf = !speakerName || speakerName === "Вы" || speakerName === "You" || !isRealName(speakerName);
+      const isUnresolvedSelf = !speakerName || isSelfPlaceholderName(speakerName) || !isRealName(speakerName);
       if (isUnresolvedSelf) {
         const discoveredName = PLATFORM === 'zoom' ? getZoomActiveSpeakerName() : getUserRealName();
         if (discoveredName) {
@@ -1092,6 +1487,7 @@ const captionObserver = new MutationObserver((mutations) => {
       }
 
       speechText = sanitizeSpeechText(speakerName, speechText);
+      speechText = applyLiveQualityFilters(speechText);
       if (!speechText) {
         mtLog('mutation-observer:skip-sanitized-empty');
         continue;
@@ -1108,6 +1504,14 @@ const captionObserver = new MutationObserver((mutations) => {
       if (existingEntry) {
         if (existingEntry.text !== speechText) {
           existingEntry.text = speechText;
+          existingEntry.name = speakerName;
+          upsertCaptionBufferEvent({
+            id: blockId,
+            source: 'captions-dom',
+            speakerName: speakerName,
+            text: speechText,
+            isFinal: true
+          });
           mtLog('mutation-observer:update-entry', {
             blockId: blockId,
             speakerName: speakerName,
@@ -1116,7 +1520,44 @@ const captionObserver = new MutationObserver((mutations) => {
           saveTranscript();
         }
       } else {
-        transcript.push({ id: blockId, name: speakerName, text: speechText, _selfUnresolved: isUnresolvedSelf && !getUserRealName() });
+        const duplicateEntry = PLATFORM === 'meet'
+          ? findDuplicateCaptionEntry(speechText, speakerName, blockId)
+          : null;
+        if (duplicateEntry) {
+          const merged = mergeDuplicateCaptionEntry(duplicateEntry, {
+            name: speakerName,
+            text: speechText,
+            source: 'captions-dom'
+          });
+          mtLog('mutation-observer:dedupe-merged-entry', {
+            blockId: blockId,
+            existingId: duplicateEntry.id,
+            merged: merged,
+            speakerName: duplicateEntry.name,
+            textLength: duplicateEntry.text.length
+          });
+          if (merged) {
+            saveTranscript();
+            refreshUI();
+          }
+          continue;
+        }
+
+        upsertCaptionBufferEvent({
+          id: blockId,
+          source: 'captions-dom',
+          speakerName: speakerName,
+          text: speechText,
+          isFinal: true
+        });
+        transcript.push({
+          id: blockId,
+          name: speakerName,
+          text: speechText,
+          _source: 'captions-dom',
+          _timestamp: Date.now(),
+          _selfUnresolved: isUnresolvedSelf && !getUserRealName()
+        });
         mtLog('mutation-observer:new-entry', {
           blockId: blockId,
           speakerName: speakerName,
@@ -1132,18 +1573,10 @@ const captionObserver = new MutationObserver((mutations) => {
             setTimeout(() => {
               const resolved = PLATFORM === 'zoom' ? getZoomActiveSpeakerName() : getUserRealName();
               if (!resolved) return;
-              // Backfill ALL unresolved self-entries recorded so far
-              let patched = 0;
-              transcript.forEach(e => {
-                if (e._selfUnresolved && e.name !== resolved) {
-                  e.name = resolved;
-                  e._selfUnresolved = false;
-                  patched++;
-                }
-              });
+              rememberUserRealName(resolved, `${PLATFORM}-dom-retry`);
+              const patched = applySelfSpeakerNameBackfill({ persist: true });
               if (patched > 0) {
                 mtLog('mutation-observer:retry-resolved-name-backfill', { resolved, patched });
-                saveTranscript();
                 refreshUI();
               }
             }, delay);
@@ -1181,11 +1614,193 @@ function ensureCaptionObserverAttached() {
 
 ensureCaptionObserverAttached();
 
+// ── Zoom caption visibility + recovery ───────────────────────
+const ZOOM_CAPTION_HIDE_STYLE_ID = '__mt-zoom-caption-hide';
+const ZOOM_CONTENT_ARIA_FALLBACK_ENABLED = false;
+
+function dispatchZoomCaptureCommand(command, reason) {
+  if (PLATFORM !== 'zoom') return;
+  try {
+    document.dispatchEvent(new CustomEvent('__mt_zoom_command', {
+      detail: {
+        command: command,
+        reason: reason || 'unspecified',
+        timestamp: Date.now()
+      }
+    }));
+    mtLog('zoom-command:dispatch', { command: command, reason: reason || 'unspecified' });
+  } catch (e) {
+    mtWarn('zoom-command:dispatch-failed', e && e.message);
+  }
+}
+
+function injectZoomCaptionHideStyle() {
+  if (PLATFORM !== 'zoom') return;
+  const targetDocument = getZoomWebclientDocument();
+  let style = targetDocument.getElementById(ZOOM_CAPTION_HIDE_STYLE_ID);
+  if (!style) {
+    style = targetDocument.createElement('style');
+    style.id = ZOOM_CAPTION_HIDE_STYLE_ID;
+    style.textContent = `
+      #live-transcription-subtitle,
+      .live-transcription-subtitle,
+      .live-transcription-subtitle__box,
+      .live-transcription-subtitle__item,
+      [class*="live-transcription-subtitle" i] {
+        opacity: 0.01 !important;
+        pointer-events: none !important;
+        transform: translateY(80px) scale(0.01) !important;
+        transform-origin: bottom center !important;
+        max-height: 1px !important;
+        overflow: hidden !important;
+      }
+    `;
+    targetDocument.documentElement.appendChild(style);
+    mtLog('zoom-caption-hide:style-injected');
+  }
+}
+
+function removeZoomCaptionHideStyle() {
+  const targetDocument = getZoomWebclientDocument();
+  const style = targetDocument.getElementById(ZOOM_CAPTION_HIDE_STYLE_ID);
+  if (style) {
+    style.remove();
+    mtLog('zoom-caption-hide:style-removed');
+  }
+}
+
+function syncZoomCaptionHideStyle() {
+  if (PLATFORM !== 'zoom') return;
+  // Keep Zoom's native caption DOM visible enough to be measurable/readable.
+  // TranscripTonic relies on .live-transcription-subtitle__box inside #webclient;
+  // shrinking that node breaks both DOM observation and our visible-bubble fallback.
+  removeZoomCaptionHideStyle();
+}
+
+function ensureZoomTranscriptionActive(reason) {
+  if (PLATFORM !== 'zoom' || !isRecording) return;
+  const now = Date.now();
+  if (now - zoomLastEnsureTranscriptionAt < 6000) return;
+  zoomLastEnsureTranscriptionAt = now;
+  syncZoomCaptionHideStyle();
+  dispatchZoomCaptureCommand('startCaptionMonitoring', reason);
+  dispatchZoomCaptureCommand('ensureTranscription', reason);
+}
+
+function tryEnableZoomTranscriptionOnRecordingStart(trigger) {
+  if (PLATFORM !== 'zoom') return;
+  zoomLastCaptionActivityAt = Date.now();
+  syncZoomCaptionHideStyle();
+  dispatchZoomCaptureCommand('startCaptionMonitoring', trigger || 'recording-start');
+  setTimeout(() => ensureZoomTranscriptionActive(trigger || 'recording-start'), 600);
+  setTimeout(() => ensureZoomTranscriptionActive((trigger || 'recording-start') + '-retry'), 3000);
+}
+
+function isZoomUiContainer(el) {
+  if (!el || !el.closest) return false;
+  return !!el.closest([
+    '[role="dialog"]',
+    '[role="menu"]',
+    '[role="navigation"]',
+    '[class*="setting" i]',
+    '[class*="chat" i]',
+    '[class*="sidebar" i]',
+    '[class*="notification" i]',
+    '[class*="toast" i]',
+    '[class*="popover" i]',
+    '[class*="modal" i]',
+    '[class*="menu" i]',
+    '[class*="toolbar" i]'
+  ].join(','));
+}
+
+function getZoomVisibleCaptionRect(el) {
+  if (!el || !el.getBoundingClientRect) return null;
+  const rect = el.getBoundingClientRect();
+  if (!rect || rect.width <= 0 || rect.height <= 0) return null;
+  return rect;
+}
+
+function isLikelyZoomCaptionBubble(el) {
+  const raw = (el && el.textContent || '').replace(/\s+/g, ' ').trim();
+  if (!raw || raw.length < 3 || raw.length > 260) return false;
+  if (raw.split(/\s+/).filter(Boolean).length < 2) return false;
+  if (isSystemCaptionNoise(raw)) return false;
+  if (isZoomUiContainer(el)) return false;
+
+  const rect = getZoomVisibleCaptionRect(el);
+  if (!rect) return false;
+  const ownerDocument = el.ownerDocument || document;
+  const ownerWindow = ownerDocument.defaultView || window;
+  const viewportHeight = ownerWindow.innerHeight || ownerDocument.documentElement.clientHeight || 0;
+  const viewportWidth = ownerWindow.innerWidth || ownerDocument.documentElement.clientWidth || 0;
+  if (!viewportHeight || !viewportWidth) return false;
+
+  if (rect.top < viewportHeight * 0.48) return false;
+  if (rect.bottom > viewportHeight - 18) return false;
+  if (rect.width > viewportWidth * 0.90 || rect.height > viewportHeight * 0.32) return false;
+  if (rect.left < 30 || rect.right > viewportWidth - 30) return false;
+  return true;
+}
+
+function findVisibleZoomCaptionBubble() {
+  const targetDocument = getZoomWebclientDocument();
+  if (PLATFORM !== 'zoom' || !targetDocument.body) return null;
+  const selectors = [
+    '#live-transcription-subtitle',
+    '.live-transcription-subtitle__box',
+    '.live-transcription-subtitle__item',
+    '[class*="live-transcription-subtitle" i]',
+    '[class*="closed-caption" i]',
+    '[class*="caption-subtitle" i]',
+    '[data-testid*="caption" i]',
+    '[class*="subtitle" i]',
+    '[class*="caption" i]',
+    '[id*="subtitle" i]',
+    '[id*="caption" i]'
+  ];
+
+  const candidates = [];
+  const transcriptonicTarget = targetDocument.querySelector('.live-transcription-subtitle__box');
+  if (transcriptonicTarget && transcriptonicTarget.lastChild) {
+    const lastText = (transcriptonicTarget.lastChild.textContent || '').replace(/\s+/g, ' ').trim();
+    if (lastText && lastText.length >= 3 && lastText.length <= 260 && !isSystemCaptionNoise(lastText)) {
+      return transcriptonicTarget.lastChild;
+    }
+  }
+
+  selectors.forEach((selector) => {
+    try {
+      targetDocument.querySelectorAll(selector).forEach((el) => {
+        if (isLikelyZoomCaptionBubble(el)) candidates.push(el);
+      });
+    } catch (e) {
+      mtWarn('zoom-visible-caption:selector-failed', { selector, error: e && e.message });
+    }
+  });
+
+  if (candidates.length === 0) {
+    targetDocument.body.querySelectorAll('*').forEach((el) => {
+      if (el.children && el.children.length > 8) return;
+      if (isLikelyZoomCaptionBubble(el)) candidates.push(el);
+    });
+  }
+
+  if (candidates.length === 0) return null;
+  candidates.sort((a, b) => {
+    const ar = a.getBoundingClientRect();
+    const br = b.getBoundingClientRect();
+    const aScore = (ar.width * ar.height) + ar.top;
+    const bScore = (br.width * br.height) + br.top;
+    return bScore - aScore;
+  });
+  return candidates[0];
+}
+
 // ── Zoom aria-live periodic scan (fallback) ──────────────────
-// Zoom sometimes replaces entire subtitle DOM subtrees rather than mutating
-// text in place, which can cause MutationObserver to fire on the wrong level.
-// This scanner directly reads all aria-live regions every 600 ms as a safety net.
-if (PLATFORM === 'zoom') {
+// Disabled by default: broad aria-live regions reuse one DOM node in Zoom and
+// can overwrite the transcript. MAIN-world zoom-capture.js is the primary path.
+if (PLATFORM === 'zoom' && ZOOM_CONTENT_ARIA_FALLBACK_ENABLED) {
   const zoomAriaLiveCache = new Map(); // element → last seen text
 
   setInterval(() => {
@@ -1223,10 +1838,24 @@ if (PLATFORM === 'zoom') {
         if (existing.text !== text) {
           existing.text = text;
           existing.name = speakerName;
+          upsertCaptionBufferEvent({
+            id: elId,
+            source: 'zoom-aria-live',
+            speakerName: speakerName,
+            text: text,
+            isFinal: true
+          });
           mtLog('zoom-aria-live:update-entry', { id: elId, speakerName: speakerName, textLength: text.length });
           saveTranscript();
         }
       } else {
+        upsertCaptionBufferEvent({
+          id: elId,
+          source: 'zoom-aria-live',
+          speakerName: speakerName,
+          text: text,
+          isFinal: true
+        });
         transcript.push({ id: elId, name: speakerName, text });
         mtLog('zoom-aria-live:new-entry', { id: elId, speakerName: speakerName, textLength: text.length });
         saveTranscript();
@@ -1354,8 +1983,18 @@ if (PLATFORM === 'meet') {
       speakerName = getUserRealName() || 'Speaker';
     }
 
-    const cleanText = sanitizeSpeechText(speakerName, text.trim());
+    let cleanText = sanitizeSpeechText(speakerName, text.trim());
+    cleanText = applyLiveQualityFilters(cleanText);
     if (!cleanText) return;
+
+    const rememberedSelfName = rememberUserRealNameFromMatchingSelfCaption(
+      speakerName,
+      cleanText,
+      'meet-rtc-matching-caption'
+    );
+    if (rememberedSelfName) {
+      applySelfSpeakerNameBackfill({ persist: true });
+    }
 
     const existing = transcript.find(e => e.id === messageId);
     if (existing) {
@@ -1365,6 +2004,13 @@ if (PLATFORM === 'meet') {
         existing.text = cleanText;
         existing.name = speakerName;
         existing._rtcVersion = messageVersion;
+        upsertCaptionBufferEvent({
+          id: messageId,
+          source: _source || 'captions',
+          speakerName: speakerName,
+          text: cleanText,
+          isFinal: true
+        });
         markMeetCaptionActivity(_source || 'rtc-update');
         mtLog('meet-caption:update-entry', {
           messageId: messageId,
@@ -1375,7 +2021,45 @@ if (PLATFORM === 'meet') {
         saveTranscript();
       }
     } else {
-      transcript.push({ id: messageId, name: speakerName, text: cleanText, _rtcVersion: messageVersion });
+      const duplicateEntry = findDuplicateCaptionEntry(cleanText, speakerName, messageId);
+      if (duplicateEntry) {
+        const merged = mergeDuplicateCaptionEntry(duplicateEntry, {
+          name: speakerName,
+          text: cleanText,
+          source: _source || 'captions',
+          rtcVersion: messageVersion
+        });
+        markMeetCaptionActivity(_source || 'rtc-dedupe');
+        mtLog('meet-caption:dedupe-merged-entry', {
+          messageId: messageId,
+          existingId: duplicateEntry.id,
+          merged: merged,
+          messageVersion: messageVersion,
+          speakerName: duplicateEntry.name,
+          textLength: duplicateEntry.text.length
+        });
+        if (merged) {
+          saveTranscript();
+          refreshUI();
+        }
+        return;
+      }
+
+      upsertCaptionBufferEvent({
+        id: messageId,
+        source: _source || 'captions',
+        speakerName: speakerName,
+        text: cleanText,
+        isFinal: true
+      });
+      transcript.push({
+        id: messageId,
+        name: speakerName,
+        text: cleanText,
+        _source: _source || 'captions',
+        _timestamp: Date.now(),
+        _rtcVersion: messageVersion
+      });
       markMeetCaptionActivity(_source || 'rtc-new');
       mtLog('meet-caption:new-entry', {
         messageId: messageId,
@@ -1397,12 +2081,127 @@ if (PLATFORM === 'meet') {
 //
 if (PLATFORM === 'zoom') {
   var zoomSeenCaptions = {}; // Track seen captions by normalized speaker+text to prevent duplicates
+  var zoomLiveDraftEntryId = null;
 
-  document.addEventListener('__mt_zoom_caption', (evt) => {
+  function makeZoomTextHash(value) {
+    return Math.abs(String(value || '').split('').reduce((acc, ch) => ((acc * 31) + ch.charCodeAt(0)) | 0, 0)).toString(36);
+  }
+
+  function getZoomCaptionKey(speaker, text) {
+    return `${normalizeSpeakerForDedupe(speaker)}|${normalizeTranscriptTextForDedupe(text)}`;
+  }
+
+  function commonPrefixLength(a, b) {
+    const left = String(a || '');
+    const right = String(b || '');
+    const max = Math.min(left.length, right.length);
+    let idx = 0;
+    while (idx < max && left[idx] === right[idx]) idx++;
+    return idx;
+  }
+
+  function isZoomLiveRevision(previousText, nextText) {
+    const previous = normalizeTranscriptTextForDedupe(previousText);
+    const next = normalizeTranscriptTextForDedupe(nextText);
+    if (!previous || !next) return false;
+    if (previous === next) return true;
+    if (previous.startsWith(next) || next.startsWith(previous)) return true;
+
+    const prefix = commonPrefixLength(previous, next);
+    const shorter = Math.min(previous.length, next.length);
+    return shorter >= 18 && prefix / shorter >= 0.65;
+  }
+
+  function getZoomContinuationSuffix(previousText, nextText) {
+    const previous = String(previousText || '').replace(/\s+/g, ' ').trim();
+    const next = String(nextText || '').replace(/\s+/g, ' ').trim();
+    if (!previous || !next || next.length <= previous.length) return '';
+    if (next.startsWith(previous)) {
+      return next.slice(previous.length).replace(/^[\s,.;:!?-]+/, '').trim();
+    }
+
+    const prefix = commonPrefixLength(previous, next);
+    if (prefix >= Math.min(previous.length, next.length) * 0.65) {
+      return next.slice(prefix).replace(/^[\s,.;:!?-]+/, '').trim();
+    }
+
+    return '';
+  }
+
+  function findZoomLiveDraft() {
+    if (zoomLiveDraftEntryId) {
+      const byId = transcript.find(item => item && item.id === zoomLiveDraftEntryId);
+      if (byId) return byId;
+    }
+    const lastEntry = transcript[transcript.length - 1];
+    return lastEntry && lastEntry._source === 'zoom-dom' && !lastEntry._zoomFinal ? lastEntry : null;
+  }
+
+  function upsertZoomEntryBuffer(entry) {
+    if (!entry) return;
+    upsertCaptionBufferEvent({
+      id: entry.id,
+      source: entry._source || 'zoom-dom',
+      startTs: entry._zoomStartTs || entry._timestamp || Date.now(),
+      endTs: entry._updatedAt || entry._timestamp || Date.now(),
+      speakerName: entry.name,
+      text: entry.text,
+      isFinal: !!entry._zoomFinal
+    });
+  }
+
+  function createZoomTranscriptEntry(speaker, text, timestamp, reason) {
+    const now = Date.now();
+    const eventTs = Number.isFinite(Number(timestamp)) ? Number(timestamp) : now;
+    const key = getZoomCaptionKey(speaker, text);
+    const entry = {
+      id: `zoom-${eventTs}-${makeZoomTextHash(key)}`,
+      name: speaker,
+      text: text,
+      _source: 'zoom-dom',
+      _timestamp: eventTs,
+      _updatedAt: now,
+      _zoomStartTs: now,
+      _zoomFinal: false
+    };
+    transcript.push(entry);
+    zoomLiveDraftEntryId = entry.id;
+    zoomSeenCaptions[key] = now;
+    upsertZoomEntryBuffer(entry);
+    mtLog('zoom-caption:new-entry', {
+      speaker: speaker,
+      reason: reason || 'new',
+      textLength: text.length,
+      transcriptLength: transcript.length
+    });
+    saveTranscript();
+    return entry;
+  }
+
+  function updateZoomDraftEntry(entry, text, timestamp) {
+    const now = Date.now();
+    const oldLength = entry.text.length;
+    entry.text = text;
+    entry._updatedAt = now;
+    entry._zoomFinal = false;
+    if (Number.isFinite(Number(timestamp))) {
+      entry._eventTs = Number(timestamp);
+    }
+    zoomLiveDraftEntryId = entry.id;
+    zoomSeenCaptions[getZoomCaptionKey(entry.name, text)] = now;
+    upsertZoomEntryBuffer(entry);
+    mtLog('zoom-caption:draft-update', {
+      speaker: entry.name,
+      oldLength: oldLength,
+      newLength: text.length
+    });
+    saveTranscript();
+  }
+
+  function handleZoomCaptionText(speaker, text, timestamp, source) {
     if (!isRecording) return;
-    const { speaker, text, timestamp } = evt.detail || {};
 
-    if (!text || !speaker) {
+    if (!text) {
       mtWarn('zoom-caption:skip-missing-required', {
         hasText: !!text,
         hasSpeaker: !!speaker
@@ -1410,54 +2209,114 @@ if (PLATFORM === 'zoom') {
       return;
     }
 
-    const cleanText = sanitizeSpeechText(speaker, text.trim());
+    zoomLastCaptionActivityAt = Date.now();
+    syncZoomCaptionHideStyle();
+
+    const speakerName = speaker && speaker !== 'Unknown Speaker'
+      ? speaker
+      : (getZoomActiveSpeakerName() || getUserRealName() || 'Speaker');
+
+    const zoomSpeechText = sanitizeZoomSpeechText(text.trim());
+    if (!zoomSpeechText) return;
+
+    let cleanText = sanitizeSpeechText(speakerName, zoomSpeechText);
+    cleanText = applyLiveQualityFilters(cleanText);
     if (!cleanText) return;
 
-    // Create normalized key for deduplication
-    const normalizedKey = (speaker + '|' + cleanText).toLowerCase();
-    const lastSeenTime = zoomSeenCaptions[normalizedKey];
     const now = Date.now();
+    const draft = findZoomLiveDraft();
 
-    // Skip if we've seen this exact speaker+text within the last 3 seconds
+    if (
+      draft &&
+      draft.name === speakerName &&
+      typeof draft.text === 'string' &&
+      isZoomLiveRevision(draft.text, cleanText)
+    ) {
+      const draftAgeMs = now - (draft._zoomStartTs || draft._timestamp || 0);
+      const correctionWindowMs = 4500;
+
+      if (draftAgeMs <= correctionWindowMs) {
+        if (cleanText.length >= draft.text.length) {
+          updateZoomDraftEntry(draft, cleanText, timestamp);
+          return;
+        }
+
+        mtLog('zoom-caption:draft-ignore-regression', {
+          speaker: speakerName,
+          previousLength: draft.text.length,
+          incomingLength: cleanText.length
+        });
+        return;
+      }
+
+      draft._zoomFinal = true;
+      upsertZoomEntryBuffer(draft);
+      zoomLiveDraftEntryId = null;
+
+      const suffix = getZoomContinuationSuffix(draft.text, cleanText);
+      if (suffix) {
+        const filteredSuffix = applyLiveQualityFilters(suffix);
+        if (!filteredSuffix) return;
+        cleanText = filteredSuffix;
+      } else if (draft.text.length >= cleanText.length) {
+        mtLog('zoom-caption:skip-expired-regression', {
+          speaker: speakerName,
+          previousLength: draft.text.length,
+          incomingLength: cleanText.length
+        });
+        return;
+      }
+    }
+
+    if (draft && !draft._zoomFinal) {
+      draft._zoomFinal = true;
+      upsertZoomEntryBuffer(draft);
+      if (zoomLiveDraftEntryId === draft.id) zoomLiveDraftEntryId = null;
+    }
+
+    const normalizedKey = getZoomCaptionKey(speakerName, cleanText);
+    const lastSeenTime = zoomSeenCaptions[normalizedKey];
     if (lastSeenTime && now - lastSeenTime < 3000) {
       mtLog('zoom-caption:skip-recent-duplicate', {
-        speaker: speaker,
+        speaker: speakerName,
         textPreview: cleanText.substring(0, 40),
         msSinceLastSeen: now - lastSeenTime
       });
       return;
     }
 
-    // Update last seen time for this caption
-    zoomSeenCaptions[normalizedKey] = now;
-
-    // Use speaker + normalized text as ID (more stable than timestamp)
-    const textHash = Math.abs(normalizedKey.split('').reduce((a, c) => a * 31 + c.charCodeAt(0), 0)).toString(36);
-    const entryId = `zoom-${textHash}`;
-    const existing = transcript.find(e => e.id === entryId);
-
-    if (!existing) {
-      transcript.push({
-        id: entryId,
-        name: speaker,
-        text: cleanText,
-        _source: 'zoom-dom',
-        _timestamp: timestamp
-      });
-      mtLog('zoom-caption:new-entry', {
-        speaker: speaker,
-        textLength: cleanText.length,
-        transcriptLength: transcript.length
-      });
-      saveTranscript();
-    } else {
-      mtLog('zoom-caption:duplicate-entry-ignored', {
-        speaker: speaker,
-        textPreview: cleanText.substring(0, 40),
-        entryId: entryId
-      });
+    createZoomTranscriptEntry(speakerName, cleanText, timestamp, 'caption-event');
+    if (source) {
+      mtLog('zoom-caption:ingested', { source, speaker: speakerName, textLength: cleanText.length });
     }
+  }
+
+  document.addEventListener('__mt_zoom_caption', (evt) => {
+    const { speaker, text, timestamp } = evt.detail || {};
+    handleZoomCaptionText(speaker, text, timestamp, 'main-world');
   });
+
+  let lastVisibleZoomCaptionText = '';
+  setInterval(() => {
+    if (!isRecording) return;
+    const bubble = findVisibleZoomCaptionBubble();
+    if (!bubble) {
+      if (Date.now() - zoomLastEnsureTranscriptionAt > 5000) {
+        mtLog('zoom-visible-caption:not-found', {
+          hasWebclient: !!document.querySelector('#webclient'),
+          rootIsIframe: getZoomWebclientDocument() !== document
+        });
+      }
+      return;
+    }
+
+    const raw = (bubble.textContent || '').replace(/\s+/g, ' ').trim();
+    if (!raw || raw === lastVisibleZoomCaptionText) return;
+    lastVisibleZoomCaptionText = raw;
+
+    const speakerName = getZoomActiveSpeakerName() || getUserRealName() || 'Speaker';
+    handleZoomCaptionText(speakerName, raw, Date.now(), 'content-visible-bubble');
+  }, 500);
 
   document.addEventListener('__mt_zoom_transcription_status', (evt) => {
     const { isActive, menuVisible, timestamp } = evt.detail || {};
@@ -1486,22 +2345,10 @@ const MEET_CAPTION_LABEL_HINTS = [
 ];
 
 function injectMeetCaptionHideStyle() {
-  if (document.getElementById(MEET_CAPTION_HIDE_STYLE_ID)) return;
-  const style = document.createElement('style');
-  style.id = MEET_CAPTION_HIDE_STYLE_ID;
-  // Hide the entire captions bar (.a4cQT) so it collapses completely.
-  // display:none is safe — MutationObserver fires regardless of CSS display,
-  // and RTC capture runs in the MAIN world so CSS cannot affect it.
-  // Inner selectors are belt-and-braces for Meet builds that render the bar
-  // outside .a4cQT.
-  style.textContent =
-    ".a4cQT," +
-    "div[jsname='dsyhDe'],div[jsname='dqMPrb']," +
-    "div[jsname='W297wb'],.nMcdL,[jsname='YSZ4cc'],[jsname='Vpvi7b']," +
-    "div:has(>div[jsname='dsyhDe']),div:has(>div[jsname='dqMPrb'])" +
-    "{display:none!important}";
-  document.head.appendChild(style);
-  mtLog('caption-keeper:hide-style-injected');
+  // Do not style Meet's native caption bar. On current Meet builds compacting
+  // .a4cQT can leave a persistent black overlay and break normal CC toggling.
+  // Capture is kept alive by the MAIN-world RTC captions channel instead.
+  removeMeetCaptionHideStyle();
 }
 
 function removeMeetCaptionHideStyle() {
@@ -1550,8 +2397,8 @@ function isMeetCaptionsEnabled(btn) {
   const label = getMeetControlLabel(btn);
   if (!label) return null;
 
-  // When captions bar is CSS-hidden, Meet's label can become unreliable
-  // (often always "Show captions"). Avoid false toggles from label-only state.
+  // When captions bar is extension-styled, Meet's label can become unreliable.
+  // Avoid false toggles from label-only state.
   if (document.getElementById(MEET_CAPTION_HIDE_STYLE_ID)) return null;
 
   // "turn on/show" => currently off, "turn off/hide" => currently on.
@@ -1569,9 +2416,11 @@ function clearMeetCaptionBootstrapTimer() {
 
 // Re-enable server-side captions (e.g. after showing the bar, or after a drop).
 // Uses suppressNextMeetCaptionToggleClick so our click interceptor ignores it.
-function ensureMeetCaptionsEnabled() {
+function ensureMeetCaptionsEnabled(options = {}) {
   const btn = getMeetCaptionsToggleButton();
-  if (!btn || isMeetCaptionsEnabled(btn) !== false) return;
+  if (!btn) return false;
+  const enabled = isMeetCaptionsEnabled(btn);
+  if (enabled !== false && !options.forceClick) return false;
   suppressNextMeetCaptionToggleClick = true;
   meetCaptionEnabledByBootstrap = true;
   try {
@@ -1580,7 +2429,11 @@ function ensureMeetCaptionsEnabled() {
   } finally {
     suppressNextMeetCaptionToggleClick = false;
   }
-  mtLog('caption-keeper:ensure-enabled:clicked');
+  mtLog('caption-keeper:ensure-enabled:clicked', {
+    forced: !!options.forceClick,
+    detectedEnabled: enabled
+  });
+  return true;
 }
 
 function tryEnableMeetCaptionsOnRecordingStart(trigger) {
@@ -1685,28 +2538,15 @@ if (PLATFORM === 'meet') {
     if (suppressNextMeetCaptionToggleClick) return;
 
     if (meetCaptionOverlayHidden) {
-      // Captions overlay is in "hidden" mode. Intercept the click so Meet does NOT
-      // toggle server-side captions (which would stop the DataChannel stream).
-      // Use CSS presence — NOT the button label — as truth: when .a4cQT is
-      // display:none Meet always reports the button as "Show captions" regardless
-      // of actual server-side state, making label-based detection unreliable.
-      evt.preventDefault();
-      evt.stopImmediatePropagation();
-
-      if (document.getElementById(MEET_CAPTION_HIDE_STYLE_ID)) {
-        // Bar is currently hidden → user wants to show it.
-        removeMeetCaptionHideStyle();
-        window.dispatchEvent(new Event('resize'));
-        ensureMeetCaptionsEnabled(); // re-confirm server-side captions are ON
-        meetCaptionManualVisible = true;
-        mtLog('caption-keeper:intercept-user-showed-bar');
-      } else {
-        // Bar is currently visible → user wants to hide it.
-        injectMeetCaptionHideStyle();
-        window.dispatchEvent(new Event('resize'));
-        meetCaptionManualVisible = false;
-        mtLog('caption-keeper:intercept-user-hid-bar');
-      }
+      // Let the native Meet CC button work normally. RTC capture is independent
+      // from the visual overlay, and blocking this click traps users with an
+      // unclosable caption bar on current Meet builds.
+      setTimeout(() => {
+        const enabled = isMeetCaptionsEnabled(ccBtn);
+        meetCaptionEnabledByBootstrap = false;
+        meetCaptionManualVisible = enabled !== false;
+        mtLog('caption-keeper:native-toggle-tracked', { enabled });
+      }, 120);
       return;
     }
 
@@ -1738,6 +2578,45 @@ if (PLATFORM === 'meet') {
     meetSoftRecoverCount = 0;
   });
 
+  document.addEventListener('__mt_meet_channel_state', (evt) => {
+    if (!isRecording) return;
+
+    const detail = (evt && evt.detail) || {};
+    if (detail.label !== 'captions') return;
+
+    mtLog('meet-capture:channel-state', detail);
+
+    if (detail.state !== 'close') return;
+
+    const now = Date.now();
+    if (now - lastMeetRecoveryAt < 3000) return;
+    lastMeetRecoveryAt = now;
+
+    setTimeout(() => {
+      if (!isRecording) return;
+
+      // Reattach the RTC channel. Do not force-click Meet's CC button while the
+      // user is allowed to close native captions; that would reopen the visual
+      // overlay immediately after they close it.
+      const clicked = meetCaptionOverlayHidden
+        ? false
+        : ensureMeetCaptionsEnabled({ forceClick: false });
+      mtWarn('caption-keeper:on-channel-close', {
+        clicked: clicked,
+        overlayHidden: meetCaptionOverlayHidden,
+        channel: detail
+      });
+
+      document.dispatchEvent(new CustomEvent('__mt_meet_recover_capture', {
+        detail: {
+          reason: 'caption-channel-close',
+          channel: detail,
+          transcriptLength: transcript.length
+        }
+      }));
+    }, 800);
+  });
+
   setInterval(() => {
     if (!isRecording) {
       // Remove the hide overlay when not recording so the user can use
@@ -1762,9 +2641,9 @@ if (PLATFORM === 'meet') {
     if (meetCaptionBootstrapTimer) return;
 
     // meetCaptionManualVisible is managed exclusively by the click interceptor.
-    // Do NOT re-derive it from button state here: when .a4cQT is display:none
-    // Meet always reports the button as "Show captions" regardless of server state,
-    // which would incorrectly override the user's explicit toggle choice.
+    // Do NOT re-derive it from button state here: while the extension styles the
+    // overlay, Meet can report a misleading captions label and override the
+    // user's explicit toggle choice.
     if (meetCaptionOverlayHidden && !meetCaptionManualVisible) {
       injectMeetCaptionHideStyle();
     } else {
@@ -2252,6 +3131,7 @@ function injectWidget() {
       ensureCaptionObserverAttached();
       setScopedRecordingState(true, []);
       tryEnableMeetCaptionsOnRecordingStart('widget-toggle');
+      tryEnableZoomTranscriptionOnRecordingStart('widget-toggle');
       setPanelOpen(false);
       debugDevLog('record-start', `sessionId=${currentSessionId}`);
     } else {
@@ -2266,6 +3146,9 @@ function injectWidget() {
       if (PLATFORM === 'meet') {
         removeMeetCaptionHideStyle();
         window.dispatchEvent(new Event('resize'));
+      }
+      if (PLATFORM === 'zoom') {
+        removeZoomCaptionHideStyle();
       }
       setScopedRecordingState(false, []);
       currentSessionId = null;
@@ -2320,6 +3203,8 @@ function injectWidget() {
 
   // ── Expose refreshUI globally within this script ──
   window.__meetTranscriberRefreshUI = function () {
+    applySelfSpeakerNameBackfill({ persist: true });
+
     // Sidebar button visibility (driven by sidebarEnabled setting)
     togglePanelBtn.style.display = sidebarEnabled ? 'flex' : 'none';
     if (!sidebarEnabled && panelOpen) setPanelOpen(false);
@@ -2430,4 +3315,21 @@ setInterval(() => {
   mtLog('periodic-ui-check');
   ensureWidgetState();
   ensureCaptionObserverAttached();
+  if (PLATFORM === 'zoom') {
+    syncZoomCaptionHideStyle();
+    if (isRecording) {
+      const inactiveForMs = zoomLastCaptionActivityAt ? Date.now() - zoomLastCaptionActivityAt : Infinity;
+      if (inactiveForMs > 8000) {
+        ensureZoomTranscriptionActive('caption-inactivity');
+      }
+    }
+  }
+  if (isRecording && transcript.length > 0) {
+    const now = Date.now();
+    if (now - lastSelfNameBackfillAt >= 2000) {
+      lastSelfNameBackfillAt = now;
+      const patched = applySelfSpeakerNameBackfill({ persist: true });
+      if (patched > 0) refreshUI();
+    }
+  }
 }, 2000);
