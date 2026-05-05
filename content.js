@@ -645,7 +645,19 @@ function sanitizeZoomSpeechText(speechText) {
     return lines.slice(1).join(' ').trim();
   }
 
-  const normalized = lines.join(' ').trim();
+  let normalized = lines.join(' ').trim();
+  normalized = normalized.replace(/^joining meeting\.?\s*/i, '').trim();
+  const normalizedLower = normalized.toLowerCase();
+  if (
+    /^joining meeting\.?$/i.test(normalized) ||
+    /^you have turned on live transcription/i.test(normalizedLower) ||
+    /currently host.*reclaiming host/i.test(normalizedLower) ||
+    /^new update available/i.test(normalizedLower) ||
+    /^local data storage/i.test(normalizedLower)
+  ) {
+    return '';
+  }
+
   // Guard against picking full-page text when a selector is too broad.
   if (normalized.length > 260) return '';
   if (/^[A-ZА-ЯЁ]\s+\S+/.test(normalized)) {
@@ -2128,6 +2140,205 @@ if (PLATFORM === 'zoom') {
     return '';
   }
 
+  function normalizeZoomOverlapText(text) {
+    return String(text || '')
+      .replace(/[.,!?;:()[\]{}"«»“”„…]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .toLowerCase();
+  }
+
+  function splitZoomOverlapWords(text) {
+    const original = String(text || '').replace(/\s+/g, ' ').trim();
+    const normalizedWords = normalizeZoomOverlapText(original).split(' ').filter(Boolean);
+    if (!original || !normalizedWords.length) return [];
+
+    const rawWords = original.split(' ');
+    if (rawWords.length === normalizedWords.length) {
+      return rawWords.map((word, idx) => ({
+        raw: word,
+        normalized: normalizedWords[idx]
+      }));
+    }
+
+    return normalizedWords.map(word => ({
+      raw: word,
+      normalized: word
+    }));
+  }
+
+  function findZoomNewPart(previousText, nextText) {
+    const previous = String(previousText || '').replace(/\s+/g, ' ').trim();
+    const next = String(nextText || '').replace(/\s+/g, ' ').trim();
+    if (!next) return '';
+    if (!previous) return next;
+
+    const previousNormalized = normalizeZoomOverlapText(previous);
+    const nextNormalized = normalizeZoomOverlapText(next);
+    if (!nextNormalized || previousNormalized.includes(nextNormalized)) return '';
+
+    if (next.startsWith(previous)) {
+      return next.slice(previous.length).replace(/^[\s,.;:!?-]+/, '').trim();
+    }
+
+    const previousWords = splitZoomOverlapWords(previous);
+    const nextWords = splitZoomOverlapWords(next);
+    const maxOverlap = Math.min(previousWords.length, nextWords.length, 40);
+
+    if (previousWords.length && nextWords.length) {
+      let best = null;
+      const maxWindow = Math.min(nextWords.length, 80);
+      for (let nextStart = 0; nextStart < maxWindow; nextStart++) {
+        for (let prevStart = 0; prevStart < previousWords.length; prevStart++) {
+          let length = 0;
+          while (
+            nextStart + length < nextWords.length &&
+            prevStart + length < previousWords.length &&
+            nextWords[nextStart + length].normalized === previousWords[prevStart + length].normalized
+          ) {
+            length++;
+          }
+
+          if (length >= 5 && (!best || length > best.length || (length === best.length && prevStart > best.prevStart))) {
+            best = { nextStart, prevStart, length };
+          }
+        }
+      }
+
+      if (best && best.prevStart + best.length >= previousWords.length - 8) {
+        return nextWords.slice(best.nextStart + best.length).map(word => word.raw).join(' ').trim();
+      }
+
+      if (best && best.length >= 8 && best.nextStart <= 3) {
+        return nextWords.slice(best.nextStart + best.length).map(word => word.raw).join(' ').trim();
+      }
+    }
+
+    for (let overlap = maxOverlap; overlap > 0; overlap--) {
+      let matches = true;
+      for (let idx = 0; idx < overlap; idx++) {
+        const left = previousWords[previousWords.length - overlap + idx].normalized;
+        const right = nextWords[idx].normalized;
+        if (left !== right) {
+          matches = false;
+          break;
+        }
+      }
+      if (matches) {
+        return nextWords.slice(overlap).map(word => word.raw).join(' ').trim();
+      }
+    }
+
+    const maxKnownPrefix = Math.min(nextWords.length, previousWords.length, 40);
+    for (let prefix = maxKnownPrefix; prefix >= 3; prefix--) {
+      for (let start = 0; start <= previousWords.length - prefix; start++) {
+        let matches = true;
+        for (let idx = 0; idx < prefix; idx++) {
+          if (previousWords[start + idx].normalized !== nextWords[idx].normalized) {
+            matches = false;
+            break;
+          }
+        }
+        if (matches) {
+          return nextWords.slice(prefix).map(word => word.raw).join(' ').trim();
+        }
+      }
+    }
+
+    return next;
+  }
+
+  function appendZoomText(previousText, addition) {
+    const previous = String(previousText || '').replace(/\s+/g, ' ').trim();
+    const next = String(addition || '').replace(/\s+/g, ' ').trim();
+    if (!next) return previous;
+    if (!previous) return next;
+    return `${previous} ${next}`.replace(/\s+/g, ' ').trim();
+  }
+
+  function findBestZoomWordMatch(previousWords, nextWords) {
+    let best = null;
+    const maxNextStart = Math.min(nextWords.length, 90);
+    for (let nextStart = 0; nextStart < maxNextStart; nextStart++) {
+      for (let prevStart = 0; prevStart < previousWords.length; prevStart++) {
+        let length = 0;
+        while (
+          nextStart + length < nextWords.length &&
+          prevStart + length < previousWords.length &&
+          nextWords[nextStart + length].normalized === previousWords[prevStart + length].normalized
+        ) {
+          length++;
+        }
+
+        if (length >= 5 && (!best || length > best.length || (length === best.length && prevStart > best.prevStart))) {
+          best = { nextStart, prevStart, length };
+        }
+      }
+    }
+    return best;
+  }
+
+  function mergeZoomRollingRevision(previousText, nextText) {
+    const previous = String(previousText || '').replace(/\s+/g, ' ').trim();
+    const next = String(nextText || '').replace(/\s+/g, ' ').trim();
+    if (!next) return previous;
+    if (!previous) return next;
+
+    const previousNormalized = normalizeZoomOverlapText(previous);
+    const nextNormalized = normalizeZoomOverlapText(next);
+    if (!nextNormalized || previousNormalized === nextNormalized) return previous;
+    if (previousNormalized.includes(nextNormalized)) return previous;
+    if (nextNormalized.includes(previousNormalized)) return next;
+
+    const previousWords = splitZoomOverlapWords(previous);
+    const nextWords = splitZoomOverlapWords(next);
+    const match = findBestZoomWordMatch(previousWords, nextWords);
+    if (!match) return null;
+
+    const mergedWords = previousWords
+      .slice(0, match.prevStart)
+      .concat(nextWords.slice(match.nextStart));
+
+    return mergedWords.map(word => word.raw).join(' ').replace(/\s+/g, ' ').trim();
+  }
+
+  function compressZoomRepeatedWordRuns(text) {
+    const normalizedText = String(text || '').replace(/\s+/g, ' ').trim();
+    if (!normalizedText) return '';
+
+    let words = splitZoomOverlapWords(normalizedText);
+    if (words.length < 6) return normalizedText;
+
+    let changed = true;
+    let guard = 0;
+    while (changed && guard < 20) {
+      changed = false;
+      guard++;
+
+      for (let start = 0; start < words.length; start++) {
+        const maxRun = Math.min(24, Math.floor((words.length - start) / 2));
+        for (let run = maxRun; run >= 3; run--) {
+          let matches = true;
+          for (let idx = 0; idx < run; idx++) {
+            if (words[start + idx].normalized !== words[start + run + idx].normalized) {
+              matches = false;
+              break;
+            }
+          }
+
+          if (matches) {
+            words.splice(start + run, run);
+            changed = true;
+            break;
+          }
+        }
+        if (changed) break;
+      }
+    }
+
+    return words.map(word => word.raw).join(' ').replace(/\s+/g, ' ').trim();
+  }
+
   function findZoomLiveDraft() {
     if (zoomLiveDraftEntryId) {
       const byId = transcript.find(item => item && item.id === zoomLiveDraftEntryId);
@@ -2153,11 +2364,12 @@ if (PLATFORM === 'zoom') {
   function createZoomTranscriptEntry(speaker, text, timestamp, reason) {
     const now = Date.now();
     const eventTs = Number.isFinite(Number(timestamp)) ? Number(timestamp) : now;
-    const key = getZoomCaptionKey(speaker, text);
+    const entryText = compressZoomRepeatedWordRuns(text);
+    const key = getZoomCaptionKey(speaker, entryText);
     const entry = {
       id: `zoom-${eventTs}-${makeZoomTextHash(key)}`,
       name: speaker,
-      text: text,
+      text: entryText,
       _source: 'zoom-dom',
       _timestamp: eventTs,
       _updatedAt: now,
@@ -2171,7 +2383,7 @@ if (PLATFORM === 'zoom') {
     mtLog('zoom-caption:new-entry', {
       speaker: speaker,
       reason: reason || 'new',
-      textLength: text.length,
+      textLength: entryText.length,
       transcriptLength: transcript.length
     });
     saveTranscript();
@@ -2181,19 +2393,19 @@ if (PLATFORM === 'zoom') {
   function updateZoomDraftEntry(entry, text, timestamp) {
     const now = Date.now();
     const oldLength = entry.text.length;
-    entry.text = text;
+    entry.text = compressZoomRepeatedWordRuns(text);
     entry._updatedAt = now;
     entry._zoomFinal = false;
     if (Number.isFinite(Number(timestamp))) {
       entry._eventTs = Number(timestamp);
     }
     zoomLiveDraftEntryId = entry.id;
-    zoomSeenCaptions[getZoomCaptionKey(entry.name, text)] = now;
+    zoomSeenCaptions[getZoomCaptionKey(entry.name, entry.text)] = now;
     upsertZoomEntryBuffer(entry);
     mtLog('zoom-caption:draft-update', {
       speaker: entry.name,
       oldLength: oldLength,
-      newLength: text.length
+      newLength: entry.text.length
     });
     saveTranscript();
   }
@@ -2225,6 +2437,51 @@ if (PLATFORM === 'zoom') {
 
     const now = Date.now();
     const draft = findZoomLiveDraft();
+
+    if (draft && draft.name === speakerName && typeof draft.text === 'string') {
+      const rollingRevision = mergeZoomRollingRevision(draft.text, cleanText);
+      if (rollingRevision && rollingRevision !== draft.text) {
+        const nextText = compressZoomRepeatedWordRuns(rollingRevision);
+        updateZoomDraftEntry(draft, nextText, timestamp);
+        mtLog('zoom-caption:rolling-revision', {
+          speaker: speakerName,
+          previousLength: draft.text.length,
+          incomingLength: cleanText.length,
+          newLength: nextText.length,
+          source: source || 'unknown'
+        });
+        return;
+      }
+
+      const addition = findZoomNewPart(draft.text, cleanText);
+      if (!addition) {
+        zoomSeenCaptions[getZoomCaptionKey(speakerName, cleanText)] = now;
+        mtLog('zoom-caption:skip-buffer-overlap', {
+          speaker: speakerName,
+          previousLength: draft.text.length,
+          incomingLength: cleanText.length
+        });
+        return;
+      }
+
+      const nextText = compressZoomRepeatedWordRuns(appendZoomText(draft.text, addition));
+      if (nextText && nextText !== draft.text) {
+        updateZoomDraftEntry(draft, nextText, timestamp);
+        mtLog('zoom-caption:buffer-append', {
+          speaker: speakerName,
+          additionLength: addition.length,
+          newLength: nextText.length,
+          source: source || 'unknown'
+        });
+      }
+      return;
+    }
+
+    if (draft && !draft._zoomFinal) {
+      draft._zoomFinal = true;
+      upsertZoomEntryBuffer(draft);
+      if (zoomLiveDraftEntryId === draft.id) zoomLiveDraftEntryId = null;
+    }
 
     if (
       draft &&
