@@ -20,6 +20,7 @@
 (function () {
   if (window.__meetTranscriberGMeetCapture) return;
   window.__meetTranscriberGMeetCapture = true;
+  var VERBOSE_CAPTURE_LOGS = false;
 
   function log(step, details) {
     if (details === undefined) {
@@ -38,6 +39,7 @@
   }
 
   function dbg(step, details) {
+    if (!VERBOSE_CAPTURE_LOGS) return;
     if (details === undefined) {
       console.debug('[MeetTranscriber][meet-capture] ' + step);
       return;
@@ -481,6 +483,7 @@
   var origCreateDC = OrigRTC.prototype.createDataChannel;
   var activePeerConnection = null;
   var activeCaptionsChannel = null;
+  var activeCaptionsPeerConnection = null;
   var captionsMonitorStarted = false;
   var knownPeerConnections = [];
 
@@ -537,11 +540,43 @@
     }, 5000);
   }
 
-  function attachCaptionsChannel(pc) {
+  function safeCloseCaptionsChannel(reason) {
+    var ch = activeCaptionsChannel;
+    if (!ch) return;
     try {
+      warn('captions-channel-close-stale', {
+        reason: reason || 'unknown',
+        readyState: ch.readyState
+      });
+      ch.close();
+    } catch (e) {
+      warn('captions-channel-close-stale-failed', e && e.message ? e.message : e);
+    }
+    activeCaptionsChannel = null;
+    activeCaptionsPeerConnection = null;
+  }
+
+  function attachCaptionsChannel(pc, options) {
+    try {
+      options = options || {};
+      if (!pc) return null;
+      if (activeCaptionsChannel && activeCaptionsPeerConnection === pc && !options.force) {
+        var existingState = activeCaptionsChannel.readyState;
+        if (existingState === 'open' || existingState === 'connecting') {
+          dbg('captions-create:skip-existing-active', {
+            readyState: existingState,
+            pcState: pc.connectionState || 'unknown'
+          });
+          return activeCaptionsChannel;
+        }
+      }
+      if (activeCaptionsChannel && options.force) {
+        safeCloseCaptionsChannel(options.reason || 'force-reattach');
+      }
       log('captions-create:start');
       var ch = origCreateDC.call(pc, 'captions', { ordered: true, maxRetransmits: 10 });
       activeCaptionsChannel = ch;
+      activeCaptionsPeerConnection = pc;
       log('captions-create:ok', { readyState: ch.readyState });
 
       ch.addEventListener('open', function () {
@@ -552,7 +587,10 @@
       ch.addEventListener('close', function () {
         warn('captions-channel-close', { readyState: ch.readyState });
         dispatchChannelState('captions', 'close', ch, pc);
-        if (activeCaptionsChannel === ch) activeCaptionsChannel = null;
+        if (activeCaptionsChannel === ch) {
+          activeCaptionsChannel = null;
+          activeCaptionsPeerConnection = null;
+        }
       });
 
       ch.addEventListener('error', function (evt) {
@@ -572,7 +610,7 @@
         decompress(u8).then(function (data) {
           var msg = decodeCaptionFrame(data);
           if (msg) {
-            log('captions-message:decoded', {
+            dbg('captions-message:decoded', {
               deviceId: msg.deviceId,
               messageId: msg.messageId,
               version: msg.messageVersion,
@@ -586,8 +624,10 @@
           err('captions-message:decompress-promise-error', e);
         });
       });
+      return ch;
     } catch (e) {
       err('captions-create-failed', e);
+      return null;
     }
   }
 
@@ -659,7 +699,7 @@
             var msg = decodeCaptionFrame(data);
             if (!msg) msg = decodeSpeechFromMessageStream(data);
             if (msg) {
-              log('meet_messages:decoded', {
+              dbg('meet_messages:decoded', {
                 deviceId: msg.deviceId,
                 messageId: msg.messageId,
                 version: msg.messageVersion,
@@ -727,7 +767,7 @@
             var msg = decodeSpeechFromMessageStream(u8);
             if (!msg) msg = decodeCaptionFrame(u8);
             if (msg) {
-              log('fetch-create-meeting-message:decoded', {
+              dbg('fetch-create-meeting-message:decoded', {
                 deviceId: msg.deviceId,
                 messageId: msg.messageId,
                 version: msg.messageVersion,
@@ -776,9 +816,11 @@
       activeChannelState: activeCaptionsChannel ? activeCaptionsChannel.readyState : 'none'
     });
 
-    // Drop stale reference so monitor/recovery can promote a fresh channel.
-    activeCaptionsChannel = null;
-    attachCaptionsChannel(activePeerConnection);
+    safeCloseCaptionsChannel(detail.reason || 'recover-capture');
+    attachCaptionsChannel(activePeerConnection, {
+      force: true,
+      reason: detail.reason || 'recover-capture'
+    });
   });
 
   document.addEventListener('__mt_meet_force_rtc_reconnect', function (evt) {
@@ -790,13 +832,16 @@
     }
 
     activePeerConnection = nextPc;
-    activeCaptionsChannel = null;
+    safeCloseCaptionsChannel(detail.reason || 'force-rtc-reconnect');
     warn('force-rtc-reconnect:rotate-active-peer-connection', {
       reason: detail.reason || 'unknown',
       inactivityMs: detail.inactivityMs || 0,
       pcState: nextPc.connectionState
     });
-    attachCaptionsChannel(nextPc);
+    attachCaptionsChannel(nextPc, {
+      force: true,
+      reason: detail.reason || 'force-rtc-reconnect'
+    });
   });
 
   log('init-complete');

@@ -4,8 +4,22 @@
 // ============================================================
 
 const PLATFORM = detectPlatform();
+const VERBOSE_RUNTIME_LOGS = false;
+
+function isNoisyLogStep(step) {
+  return (
+    /^mutation-observer:/.test(step) ||
+    /^meet-caption:/.test(step) ||
+    /^meet-capture:activity/.test(step) ||
+    /^saveTranscript:/.test(step) ||
+    /^storage\.(set|get)/.test(step) ||
+    /^storage\.onChanged/.test(step) ||
+    /^refreshUI:invoke/.test(step)
+  );
+}
 
 function mtLog(step, details) {
+  if (!VERBOSE_RUNTIME_LOGS && isNoisyLogStep(step)) return;
   if (details === undefined) {
     console.log('[MeetTranscriber][content][' + PLATFORM + '] ' + step);
     return;
@@ -208,6 +222,7 @@ let zoomLastEnsureTranscriptionAt = 0;
 // before the meeting UI finishes rendering (Teams SPA issue).
 let meetingContainerEverSeen = false;
 let meetingUiMissingStreak = 0;
+let lastTranscriptStorageWriteAt = 0;
 
 const MAX_STREAM_BUFFER_ITEMS = 500;
 
@@ -599,9 +614,15 @@ function mergeDuplicateCaptionEntry(existing, next) {
   return changed;
 }
 
-function compactDuplicateCaptionEntries() {
+function compactDuplicateCaptionEntries(maxLookback) {
   let removed = 0;
-  for (let i = 0; i < transcript.length; i++) {
+  const boundedLookback = Number.isFinite(Number(maxLookback)) && Number(maxLookback) > 0
+    ? Math.floor(Number(maxLookback))
+    : null;
+  const startIndex = boundedLookback
+    ? Math.max(0, transcript.length - boundedLookback)
+    : 0;
+  for (let i = startIndex; i < transcript.length; i++) {
     const base = transcript[i];
     if (!base) continue;
     for (let j = i + 1; j < transcript.length; j++) {
@@ -883,6 +904,9 @@ function safeStorageSet(payload, callback) {
   }
 
   try {
+    if (payload && Object.prototype.hasOwnProperty.call(payload, TRANSCRIPT_STORAGE_KEY)) {
+      lastTranscriptStorageWriteAt = Date.now();
+    }
     mtLog('storage.set', { keys: Object.keys(payload || {}) });
     chrome.storage.local.set(payload, () => {
       if (chrome.runtime && chrome.runtime.lastError) {
@@ -1023,7 +1047,7 @@ safeStorageGet([
       isRecording = true;
       currentSessionId = Date.now().toString();
       replaceTranscript([]);
-      meetCaptionManualVisible = false;
+      meetCaptionManualVisible = true;
       meetCaptionEnabledByBootstrap = false;
       meetCaptionBootstrapAttemptedForSession = false;
       clearMeetCaptionBootstrapTimer();
@@ -1075,8 +1099,16 @@ if (isExtensionContextAvailable()) {
           syncZoomCaptionHideStyle();
         }
         if (changes[TRANSCRIPT_STORAGE_KEY] !== undefined) {
-          replaceTranscript(changes[TRANSCRIPT_STORAGE_KEY].newValue);
-          mtLog('storage.onChanged:transcript', { length: Array.isArray(transcript) ? transcript.length : -1 });
+          if (Date.now() - lastTranscriptStorageWriteAt < 2000) {
+            mtLog('storage.onChanged:transcript-skip-local-echo', {
+              length: Array.isArray(changes[TRANSCRIPT_STORAGE_KEY].newValue)
+                ? changes[TRANSCRIPT_STORAGE_KEY].newValue.length
+                : -1
+            });
+          } else {
+            replaceTranscript(changes[TRANSCRIPT_STORAGE_KEY].newValue);
+            mtLog('storage.onChanged:transcript', { length: Array.isArray(transcript) ? transcript.length : -1 });
+          }
         }
         if (changes['sidebarEnabled'] !== undefined) {
           sidebarEnabled = !!changes['sidebarEnabled'].newValue;
@@ -1130,7 +1162,7 @@ if (isExtensionContextAvailable()) {
         if (isRecording) {
           currentSessionId = Date.now().toString();
           replaceTranscript([]);
-          meetCaptionManualVisible = false;
+          meetCaptionManualVisible = true;
           meetCaptionEnabledByBootstrap = false;
           meetCaptionBootstrapAttemptedForSession = false;
           clearMeetCaptionBootstrapTimer();
@@ -1205,7 +1237,6 @@ function saveTranscript() {
   mtLog('saveTranscript:scheduled', { transcriptLength: transcript.length });
   saveTimeout = setTimeout(() => {
     backfillSelfSpeakerName();
-    compactDuplicateCaptionEntries();
     mtLog('saveTranscript:flush', { transcriptLength: transcript.length });
     safeStorageSet({ [TRANSCRIPT_STORAGE_KEY]: transcript });
     refreshUI();
@@ -1336,10 +1367,11 @@ window.addEventListener('beforeunload', () => stopAndSave('beforeunload'));
 // Monitor if the meeting is still active
 setInterval(() => {
   if (isRecording) {
-    // 1. Every 30s save progress to history without stopping (heartbeat)
+    // 1. Every 30s persist progress without running full session finalization.
     if (transcript.length > 0 && Date.now() % 30000 < 3000) {
-       mtLog('recording-heartbeat:finalizeSession');
-       finalizeSession();
+       mtLog('recording-heartbeat:persist-progress');
+       compactDuplicateCaptionEntries(250);
+       safeStorageSet({ [TRANSCRIPT_STORAGE_KEY]: transcript });
     }
 
     // 2. Check if meeting ended.
@@ -1440,6 +1472,12 @@ const captionObserver = new MutationObserver((mutations) => {
   // The generic DOM observer sees reused subtitle nodes and tends to overwrite
   // the latest line, so Zoom ingestion stays on the __mt_zoom_caption path.
   if (PLATFORM === 'zoom') {
+    return;
+  }
+
+  // Meet captions primarily arrive through the RTC bridge. While that stream is
+  // healthy, avoid scanning broad Meet DOM mutations on the page's main thread.
+  if (PLATFORM === 'meet' && lastMeetCaptionActivityAt && Date.now() - lastMeetCaptionActivityAt < 5000) {
     return;
   }
 
@@ -1612,9 +1650,7 @@ function ensureCaptionObserverAttached() {
   captionObserver.observe(nextRoot, {
     childList: true,
     subtree: true,
-    characterData: true,
-    attributes: true,
-    attributeFilter: ['class', 'style', 'aria-hidden', 'data-is-muted']
+    characterData: true
   });
   observedCaptionRoot = nextRoot;
   mtLog('caption-observer:attached', {
@@ -2602,10 +2638,30 @@ const MEET_CAPTION_LABEL_HINTS = [
 ];
 
 function injectMeetCaptionHideStyle() {
-  // Do not style Meet's native caption bar. On current Meet builds compacting
-  // .a4cQT can leave a persistent black overlay and break normal CC toggling.
-  // Capture is kept alive by the MAIN-world RTC captions channel instead.
-  removeMeetCaptionHideStyle();
+  let style = document.getElementById(MEET_CAPTION_HIDE_STYLE_ID);
+  if (style) return;
+  style = document.createElement('style');
+  style.id = MEET_CAPTION_HIDE_STYLE_ID;
+  style.textContent = `
+    .a4cQT,
+    div[jsname="dsyhDe"],
+    div[jsname="dqMPrb"],
+    div:has(> div[jsname="dsyhDe"]),
+    div:has(> div[jsname="dqMPrb"]),
+    div[jsname="W297wb"],
+    .iY996,
+    .V006ub,
+    .nS7Zeb,
+    .nMcdL,
+    [jsname="YSZ4cc"],
+    [jsname="Vpvi7b"] {
+      display: none !important;
+      visibility: hidden !important;
+      pointer-events: none !important;
+    }
+  `;
+  (document.head || document.documentElement).appendChild(style);
+  mtLog('caption-keeper:hide-style-injected');
 }
 
 function removeMeetCaptionHideStyle() {
@@ -2709,7 +2765,7 @@ function tryEnableMeetCaptionsOnRecordingStart(trigger) {
 
   function finish(status, detail) {
     clearMeetCaptionBootstrapTimer();
-    if ((status === 'already-enabled' || status === 'clicked-enable') && meetCaptionOverlayHidden && !meetCaptionManualVisible) {
+    if ((status === 'already-enabled' || status === 'clicked-enable') && !meetCaptionManualVisible) {
       injectMeetCaptionHideStyle();
       window.dispatchEvent(new Event('resize'));
     }
@@ -2794,41 +2850,20 @@ if (PLATFORM === 'meet') {
     if (!ccBtn || !isMeetCaptionsToggleCandidate(ccBtn)) return;
     if (suppressNextMeetCaptionToggleClick) return;
 
-    if (meetCaptionOverlayHidden) {
-      // Let the native Meet CC button work normally. RTC capture is independent
-      // from the visual overlay, and blocking this click traps users with an
-      // unclosable caption bar on current Meet builds.
-      setTimeout(() => {
-        const enabled = isMeetCaptionsEnabled(ccBtn);
-        meetCaptionEnabledByBootstrap = false;
-        meetCaptionManualVisible = enabled !== false;
-        mtLog('caption-keeper:native-toggle-tracked', { enabled });
-      }, 120);
-      return;
-    }
+    evt.stopImmediatePropagation();
+    evt.preventDefault();
 
-    // meetCaptionOverlayHidden is false — user sees native captions, allow the
-    // click through and just track the resulting state.
-    setTimeout(() => {
-      const enabled = isMeetCaptionsEnabled(ccBtn);
-      if (enabled === true) {
-        meetCaptionEnabledByBootstrap = false;
-        meetCaptionManualVisible = true;
-        mtLog('caption-keeper:manual-visible-on');
-      } else if (enabled === false) {
-        meetCaptionEnabledByBootstrap = false;
-        meetCaptionManualVisible = false;
-        mtLog('caption-keeper:manual-visible-off');
-      } else {
-        // aria-pressed/label ambiguous — use DOM presence as tiebreaker.
-        const captionDomOpen = !!document.querySelector(
-          'div[jsname="W297wb"], .iY996, .V006ub, .nMcdL, [jsname="YSZ4cc"], [jsname="Vpvi7b"]'
-        );
-        meetCaptionEnabledByBootstrap = false;
-        meetCaptionManualVisible = captionDomOpen;
-        mtLog('caption-keeper:manual-visible-dom-fallback', { captionDomOpen });
-      }
-    }, 120);
+    meetCaptionEnabledByBootstrap = false;
+    meetCaptionManualVisible = !meetCaptionManualVisible;
+
+    if (meetCaptionManualVisible) {
+      removeMeetCaptionHideStyle();
+      mtLog('caption-keeper:visual-toggle-show');
+    } else {
+      injectMeetCaptionHideStyle();
+      mtLog('caption-keeper:visual-toggle-hide');
+    }
+    window.dispatchEvent(new Event('resize'));
   }, true);
 
   document.addEventListener('__mt_meet_caption', () => {
@@ -2852,12 +2887,9 @@ if (PLATFORM === 'meet') {
     setTimeout(() => {
       if (!isRecording) return;
 
-      // Reattach the RTC channel. Do not force-click Meet's CC button while the
-      // user is allowed to close native captions; that would reopen the visual
-      // overlay immediately after they close it.
-      const clicked = meetCaptionOverlayHidden
-        ? false
-        : ensureMeetCaptionsEnabled({ forceClick: false });
+      // Reattach the RTC channel and make sure server-side captions are still
+      // on. Visual visibility is controlled only by our CSS state.
+      const clicked = ensureMeetCaptionsEnabled({ forceClick: false });
       mtWarn('caption-keeper:on-channel-close', {
         clicked: clicked,
         overlayHidden: meetCaptionOverlayHidden,
@@ -2897,11 +2929,9 @@ if (PLATFORM === 'meet') {
     // do not force CSS visibility changes from the periodic loop.
     if (meetCaptionBootstrapTimer) return;
 
-    // meetCaptionManualVisible is managed exclusively by the click interceptor.
-    // Do NOT re-derive it from button state here: while the extension styles the
-    // overlay, Meet can report a misleading captions label and override the
-    // user's explicit toggle choice.
-    if (meetCaptionOverlayHidden && !meetCaptionManualVisible) {
+    // meetCaptionManualVisible is a visual-only state. The click interceptor
+    // keeps Meet's server-side captions enabled so RTC capture continues.
+    if (!meetCaptionManualVisible) {
       injectMeetCaptionHideStyle();
     } else {
       removeMeetCaptionHideStyle();
@@ -3381,7 +3411,7 @@ function injectWidget() {
       currentSessionId = Date.now().toString();
       // Clear transcript for a fresh start if it wasn't already cleared
       transcript = [];
-      meetCaptionManualVisible = false;
+      meetCaptionManualVisible = true;
       meetCaptionEnabledByBootstrap = false;
       meetCaptionBootstrapAttemptedForSession = false;
       clearMeetCaptionBootstrapTimer();
