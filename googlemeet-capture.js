@@ -21,6 +21,32 @@
   if (window.__meetTranscriberGMeetCapture) return;
   window.__meetTranscriberGMeetCapture = true;
   var VERBOSE_CAPTURE_LOGS = false;
+  var debugState = window.__meetTranscriberGMeetCaptureDebug = window.__meetTranscriberGMeetCaptureDebug || {
+    peerConnections: 0,
+    channels: [],
+    captions: {
+      id: null,
+      readyState: null,
+      messages: 0,
+      lastMessageAt: 0,
+      lastDecodeNullAt: 0
+    },
+    mediaSession: {
+      id: null,
+      readyState: null,
+      commandSeq: 0,
+      ackSeq: 0,
+      languageSends: 0,
+      lastLanguageCode: null,
+      lastLanguageSendAt: 0,
+      lastLanguageSendReason: null
+    },
+    tactiqBridge: {
+      speechEvents: 0,
+      messages: 0,
+      lastSpeechAt: 0
+    }
+  };
 
   function log(step, details) {
     if (details === undefined) {
@@ -480,12 +506,221 @@
     return;
   }
 
+  if (window.RTCDataChannel && window.RTCDataChannel.prototype && !window.RTCDataChannel.prototype.__mtMediaSessionSendWatch) {
+    var origDataChannelSend = window.RTCDataChannel.prototype.send;
+    Object.defineProperty(window.RTCDataChannel.prototype, '__mtMediaSessionSendWatch', { value: true });
+    window.RTCDataChannel.prototype.send = function () {
+      if (this && this.label === 'media-session') {
+        rememberMediaSessionOutgoing(arguments[0], this);
+      }
+      return origDataChannelSend.apply(this, arguments);
+    };
+    log('media-session-send-watch:installed');
+  }
+
   var origCreateDC = OrigRTC.prototype.createDataChannel;
   var activePeerConnection = null;
   var activeCaptionsChannel = null;
   var activeCaptionsPeerConnection = null;
+  var activeMediaSessionChannel = null;
+  var mediaSessionCommandSeq = 0;
+  var mediaSessionAckSeq = 0;
+  var lastCaptionLanguageSentAt = 0;
+  var sendingCaptionLanguage = false;
+  var mediaSessionSendObservedTimer = null;
   var captionsMonitorStarted = false;
   var knownPeerConnections = [];
+  var fallbackDataChannelId = 50000;
+
+  var CAPTION_LANGUAGE_BY_ID = {
+    1: 'en-US',
+    2: 'es-MX',
+    3: 'es-ES',
+    4: 'pt-BR',
+    5: 'fr-FR',
+    6: 'de-DE',
+    7: 'it-IT',
+    8: 'nl-NL',
+    9: 'ja-JP',
+    10: 'ru-RU',
+    11: 'ko-KR',
+    17: 'pt-PT',
+    19: 'en-IN',
+    20: 'en-GB',
+    21: 'en-CA',
+    22: 'en-AU',
+    39: 'pl-PL',
+    44: 'uk-UA'
+  };
+
+  function writeVarint(value, out) {
+    value = Math.max(0, Number(value) || 0) >>> 0;
+    while (value > 127) {
+      out.push((value & 127) | 128);
+      value >>>= 7;
+    }
+    out.push(value);
+  }
+
+  function bytesForString(value) {
+    return Array.prototype.slice.call(new TextEncoder().encode(String(value || '')));
+  }
+
+  function fieldVarint(fieldNumber, value) {
+    var out = [];
+    writeVarint((fieldNumber << 3) | 0, out);
+    writeVarint(value, out);
+    return out;
+  }
+
+  function fieldBytes(fieldNumber, bytes) {
+    var out = [];
+    writeVarint((fieldNumber << 3) | 2, out);
+    writeVarint(bytes.length, out);
+    return out.concat(bytes);
+  }
+
+  function buildCaptionLanguageUpdate(seq, languageCode) {
+    var pair = fieldBytes(9, fieldBytes(1, bytesForString(languageCode)).concat(
+      fieldBytes(2, bytesForString(languageCode))
+    ));
+    var updateMask = fieldBytes(1, bytesForString('client_config.caption_config'));
+    var captionUpdate = fieldBytes(1, pair).concat(fieldBytes(2, updateMask));
+    var command = fieldVarint(1, seq).concat(fieldBytes(3, captionUpdate));
+    var envelope = fieldBytes(2, command);
+    return new Uint8Array(fieldBytes(1, envelope));
+  }
+
+  function buildMediaSessionAck(seq) {
+    var ack = fieldVarint(2, seq).concat(fieldVarint(3, 1));
+    var envelope = fieldBytes(1, ack);
+    return new Uint8Array(fieldBytes(1, envelope));
+  }
+
+  function readVarintAt(buf, pos) {
+    var value = 0;
+    var shift = 0;
+    while (pos < buf.length) {
+      var b = buf[pos++];
+      value |= (b & 127) << shift;
+      if (!(b & 128)) return { value: value >>> 0, pos: pos };
+      shift += 7;
+    }
+    return null;
+  }
+
+  function parseMediaSessionSequence(u8) {
+    if (!u8 || u8.length < 6 || u8[0] !== 10) return null;
+    var outerLen = readVarintAt(u8, 1);
+    if (!outerLen) return null;
+    var pos = outerLen.pos;
+    if (u8[pos] === 18) {
+      var commandLen = readVarintAt(u8, pos + 1);
+      if (!commandLen) return null;
+      pos = commandLen.pos;
+      if (u8[pos] !== 8) return null;
+      var commandSeq = readVarintAt(u8, pos + 1);
+      return commandSeq ? { type: 'command', seq: commandSeq.value } : null;
+    }
+    if (u8[pos] === 10) {
+      var ackLen = readVarintAt(u8, pos + 1);
+      if (!ackLen) return null;
+      pos = ackLen.pos;
+      if (u8[pos] !== 16) return null;
+      var ackSeq = readVarintAt(u8, pos + 1);
+      return ackSeq ? { type: 'ack', seq: ackSeq.value } : null;
+    }
+    return null;
+  }
+
+  function rememberMediaSessionOutgoing(data, channel) {
+    if (channel && channel.label === 'media-session') {
+      activeMediaSessionChannel = channel;
+      debugState.mediaSession.id = channel.id;
+      debugState.mediaSession.readyState = channel.readyState;
+    }
+
+    var u8 = toU8(data);
+    if (!u8) return;
+    var parsed = parseMediaSessionSequence(u8);
+    if (!parsed) return;
+    if (parsed.type === 'command') {
+      mediaSessionCommandSeq = Math.max(mediaSessionCommandSeq, parsed.seq);
+      debugState.mediaSession.commandSeq = mediaSessionCommandSeq;
+    }
+    if (parsed.type === 'ack') {
+      mediaSessionAckSeq = Math.max(mediaSessionAckSeq, parsed.seq);
+      debugState.mediaSession.ackSeq = mediaSessionAckSeq;
+    }
+
+    if (!sendingCaptionLanguage && activeCaptionsChannel && activeCaptionsChannel.readyState === 'open') {
+      clearTimeout(mediaSessionSendObservedTimer);
+      mediaSessionSendObservedTimer = setTimeout(function () {
+        sendCaptionLanguageSubscription('media-session-send-observed');
+      }, 0);
+    }
+  }
+
+  function getPreferredCaptionLanguageCode() {
+    try {
+      for (var i = 0; i < localStorage.length; i++) {
+        var key = localStorage.key(i);
+        if (!key || key.indexOf('rt_g3jartmcups-') === -1) continue;
+        var raw = localStorage.getItem(key);
+        if (!raw) continue;
+        var parsed = JSON.parse(raw);
+        var languageId = parsed && parsed[2];
+        if (CAPTION_LANGUAGE_BY_ID[languageId]) return CAPTION_LANGUAGE_BY_ID[languageId];
+      }
+    } catch (e) {
+      warn('caption-language:localStorage-detect-failed', e && e.message ? e.message : e);
+    }
+
+    var navLanguage = (navigator.language || 'en-US').trim();
+    if (/^ru\b/i.test(navLanguage)) return 'ru-RU';
+    return navLanguage || 'en-US';
+  }
+
+  function sendCaptionLanguageSubscription(reason) {
+    var ch = activeMediaSessionChannel;
+    if (!ch || ch.readyState !== 'open') return false;
+
+    var now = Date.now();
+    if (now - lastCaptionLanguageSentAt < 1500) return false;
+    lastCaptionLanguageSentAt = now;
+
+    var languageCode = getPreferredCaptionLanguageCode();
+    var commandSeq = mediaSessionCommandSeq + 1;
+    var ackSeq = Math.max(mediaSessionAckSeq + 1, commandSeq + 1);
+
+    try {
+      sendingCaptionLanguage = true;
+      ch.send(buildCaptionLanguageUpdate(commandSeq, languageCode));
+      mediaSessionCommandSeq = commandSeq;
+      ch.send(buildMediaSessionAck(ackSeq));
+      mediaSessionAckSeq = ackSeq;
+      ch.send(buildMediaSessionAck(ackSeq + 1));
+      mediaSessionAckSeq = ackSeq + 1;
+      debugState.mediaSession.commandSeq = mediaSessionCommandSeq;
+      debugState.mediaSession.ackSeq = mediaSessionAckSeq;
+      debugState.mediaSession.languageSends += 1;
+      debugState.mediaSession.lastLanguageCode = languageCode;
+      debugState.mediaSession.lastLanguageSendAt = now;
+      debugState.mediaSession.lastLanguageSendReason = reason || 'unknown';
+      log('caption-language:sent-media-session', {
+        reason: reason || 'unknown',
+        languageCode: languageCode,
+        commandSeq: commandSeq,
+        ackSeq: ackSeq
+      });
+      return true;
+    } catch (e) {
+      warn('caption-language:send-failed', e && e.message ? e.message : e);
+      return false;
+    } finally {
+      sendingCaptionLanguage = false;
+    }
+  }
 
   function rememberPeerConnection(pc) {
     if (!pc) return;
@@ -493,6 +728,7 @@
       if (knownPeerConnections[i].pc === pc) return;
     }
     knownPeerConnections.push({ pc: pc, seenAt: Date.now() });
+    debugState.peerConnections = knownPeerConnections.length;
     if (knownPeerConnections.length > 8) knownPeerConnections.shift();
   }
 
@@ -510,6 +746,25 @@
     if (!msg) return;
     if (source) msg._source = source;
     document.dispatchEvent(new CustomEvent('__mt_meet_caption', { detail: msg }));
+  }
+
+  function normalizeExternalCaptionMessage(raw, source) {
+    if (!raw || !raw.text) return null;
+    var deviceId = raw.deviceId || raw.device_id || raw.speakerDeviceId || raw.participantId || 'external';
+    if (deviceId && deviceId.charAt && deviceId.charAt(0) !== '@' && deviceId !== 'external') {
+      deviceId = '@' + deviceId;
+    }
+    var messageId = raw.messageId || raw.message_id || raw.id || (Date.now() + '/' + deviceId + '/' + String(raw.text).slice(0, 24));
+    if (messageId && deviceId && String(messageId).indexOf('@') === -1 && String(messageId).indexOf('/' + deviceId) === -1) {
+      messageId = String(messageId) + '/' + deviceId;
+    }
+    return {
+      deviceId: deviceId,
+      messageId: String(messageId),
+      messageVersion: Number(raw.messageVersion || raw.version || raw.message_version || 1) || 1,
+      text: String(raw.text || '').trim(),
+      _source: source || 'external'
+    };
   }
 
   function startCaptionsMonitor() {
@@ -574,17 +829,27 @@
         safeCloseCaptionsChannel(options.reason || 'force-reattach');
       }
       log('captions-create:start');
-      var ch = origCreateDC.call(pc, 'captions', { ordered: true, maxRetransmits: 10 });
+      var ch;
+      try {
+        ch = origCreateDC.call(pc, 'captions', { ordered: true, maxRetransmits: 10, id: fallbackDataChannelId++ });
+      } catch (e) {
+        ch = origCreateDC.call(pc, 'captions', { ordered: true, maxRetransmits: 10 });
+      }
       activeCaptionsChannel = ch;
       activeCaptionsPeerConnection = pc;
+      debugState.captions.id = ch.id;
+      debugState.captions.readyState = ch.readyState;
       log('captions-create:ok', { readyState: ch.readyState });
 
       ch.addEventListener('open', function () {
+        debugState.captions.readyState = ch.readyState;
         log('captions-channel-open', { readyState: ch.readyState });
         dispatchChannelState('captions', 'open', ch, pc);
+        sendCaptionLanguageSubscription('captions-channel-open');
       });
 
       ch.addEventListener('close', function () {
+        debugState.captions.readyState = ch.readyState;
         warn('captions-channel-close', { readyState: ch.readyState });
         dispatchChannelState('captions', 'close', ch, pc);
         if (activeCaptionsChannel === ch) {
@@ -610,6 +875,8 @@
         decompress(u8).then(function (data) {
           var msg = decodeCaptionFrame(data);
           if (msg) {
+            debugState.captions.messages += 1;
+            debugState.captions.lastMessageAt = Date.now();
             dbg('captions-message:decoded', {
               deviceId: msg.deviceId,
               messageId: msg.messageId,
@@ -618,12 +885,16 @@
             });
             dispatchCaption(msg, 'captions');
           } else {
+            debugState.captions.lastDecodeNullAt = Date.now();
             warn('captions-message-skip:decode-null', { bytes: data.length });
           }
         }).catch(function (e) {
           err('captions-message:decompress-promise-error', e);
         });
       });
+      if (ch.readyState === 'open') {
+        sendCaptionLanguageSubscription('captions-channel-created-open');
+      }
       return ch;
     } catch (e) {
       err('captions-create-failed', e);
@@ -651,6 +922,42 @@
     pc.addEventListener('datachannel', function (evt) {
       var ch = evt.channel;
       log('rtc-datachannel', { label: ch && ch.label, readyState: ch && ch.readyState });
+      debugState.channels.push({
+        label: ch && ch.label,
+        id: ch && ch.id,
+        readyState: ch && ch.readyState,
+        seenAt: Date.now()
+      });
+      if (debugState.channels.length > 30) debugState.channels.shift();
+
+      if (ch.label === 'media-session') {
+        log('media-session-channel-detected');
+        activeMediaSessionChannel = ch;
+        debugState.mediaSession.id = ch.id;
+        debugState.mediaSession.readyState = ch.readyState;
+        ch.addEventListener('open', function () {
+          debugState.mediaSession.readyState = ch.readyState;
+          log('media-session-channel-open', { readyState: ch.readyState });
+          sendCaptionLanguageSubscription('media-session-open');
+        });
+        ch.addEventListener('close', function () {
+          debugState.mediaSession.readyState = ch.readyState;
+          warn('media-session-channel-close', { readyState: ch.readyState });
+          if (activeMediaSessionChannel === ch) activeMediaSessionChannel = null;
+        });
+        ch.addEventListener('message', function (evt2) {
+          var u8 = toU8(evt2.data);
+          if (u8) {
+            var parsed = parseMediaSessionSequence(u8);
+            if (parsed && parsed.type === 'command') {
+              mediaSessionAckSeq = Math.max(mediaSessionAckSeq, parsed.seq);
+            }
+          }
+        });
+        activePeerConnection = pc;
+        attachCaptionsChannel(pc);
+        sendCaptionLanguageSubscription('media-session-detected');
+      }
 
       if (ch.label === 'collections') {
         log('collections-channel-detected');
@@ -821,6 +1128,7 @@
       force: true,
       reason: detail.reason || 'recover-capture'
     });
+    sendCaptionLanguageSubscription(detail.reason || 'recover-capture');
   });
 
   document.addEventListener('__mt_meet_force_rtc_reconnect', function (evt) {
@@ -841,6 +1149,38 @@
     attachCaptionsChannel(nextPc, {
       force: true,
       reason: detail.reason || 'force-rtc-reconnect'
+    });
+  });
+
+  // Diagnostic/compatibility bridge: when Tactiq is installed in the same page,
+  // it emits normalized speech through DOM events. Listening here lets us prove
+  // the rest of our pipeline works while we continue hardening standalone RTC.
+  document.documentElement.addEventListener('tactiq-message', function (evt) {
+    var detail = (evt && evt.detail) || {};
+    if (detail.type === 'deviceinfo' || detail.type === 'self-device') {
+      if (detail.deviceId && detail.deviceName) {
+        dispatchDevice({
+          deviceId: detail.deviceId,
+          deviceName: detail.deviceName
+        });
+      }
+      return;
+    }
+    if (detail.type === 'premeeting-devices' && Array.isArray(detail.devices)) {
+      detail.devices.forEach(function (device) {
+        if (device && device.deviceId && device.deviceName) dispatchDevice(device);
+      });
+      return;
+    }
+    if (detail.type !== 'speech' || !Array.isArray(detail.messages)) return;
+
+    debugState.tactiqBridge.speechEvents += 1;
+    debugState.tactiqBridge.lastSpeechAt = Date.now();
+    detail.messages.forEach(function (raw) {
+      var msg = normalizeExternalCaptionMessage(raw, 'tactiq-message');
+      if (!msg) return;
+      debugState.tactiqBridge.messages += 1;
+      dispatchCaption(msg, 'tactiq-message');
     });
   });
 

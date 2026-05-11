@@ -208,7 +208,7 @@ let autoRecordEnabled = true;  // record automatically on join; user can disable
 let qualityFusionEnabled = true; // Buzz-inspired live quality heuristics
 let minCaptionChars = 6; // Skip tiny noisy fragments
 let hideUnconfirmedEnabled = true; // Hide unstable short interim-looking fragments
-let meetCaptionOverlayHidden = true; // Tactiq-like default: capture continues while native overlay is hidden
+let meetCaptionOverlayHidden = false; // Native Meet captions stay under user control; RTC capture is independent.
 let meetTryEnableCaptionsOnStart = false; // Optional bootstrap: try enabling captions once on recording start
 let meetCaptionBootstrapAttemptedForSession = false;
 let meetCaptionBootstrapTimer = null;
@@ -447,6 +447,7 @@ function getZoomMeetingTitle() {
 
 function isRealName(name) {
   if (!name) return false;
+  if (isNonPersonSpeakerName(name)) return false;
   // Filter out technical strings
   const technical = ['720p', '360p', '1080p', 'HD', 'SD', 'unknown', 'null', 'undefined'];
   if (technical.includes(name.toLowerCase())) return false;
@@ -454,6 +455,24 @@ function isRealName(name) {
   // Should have at least one letter
   if (!/[a-zA-Zа-яА-Я]/.test(name)) return false;
   return true;
+}
+
+function isNonPersonSpeakerName(name) {
+  const normalized = String(name || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  if (!normalized) return true;
+
+  const nonPersonHints = [
+    'profile photo',
+    'profile picture',
+    'profile image',
+    'user profile',
+    'avatar',
+    '\u0444\u043e\u0442\u043e \u043f\u0440\u043e\u0444\u0438\u043b\u044f',
+    '\u043f\u0440\u043e\u0444\u0438\u043b\u044f \u043f\u043e\u043b\u044c\u0437\u043e\u0432\u0430\u0442\u0435\u043b\u044f',
+    '\u0438\u0437\u043e\u0431\u0440\u0430\u0436\u0435\u043d\u0438\u0435 \u043f\u0440\u043e\u0444\u0438\u043b\u044f'
+  ];
+
+  return nonPersonHints.some((hint) => normalized.includes(hint));
 }
 
 function escapeRegExp(str) {
@@ -797,7 +816,7 @@ function rememberUserRealNameFromMatchingSelfCaption(name, text, source) {
 
   const hasMatchingSelfCaption = transcript.some((entry) => {
     if (!entry || !entry.text) return false;
-    if (!entry._selfUnresolved && !isSelfPlaceholderName(entry.name)) return false;
+    if (!entry._selfUnresolved && !isSelfPlaceholderName(entry.name) && !isNonPersonSpeakerName(entry.name)) return false;
     return isSameLiveCaptionText(entry.text, text);
   });
 
@@ -809,7 +828,7 @@ function discoverSelfNameFromTranscript() {
   if (memoizedUserName) return memoizedUserName;
 
   const hasUnresolvedSelf = transcript.some((entry) =>
-    entry && (entry._selfUnresolved || isSelfPlaceholderName(entry.name))
+    entry && (entry._selfUnresolved || isSelfPlaceholderName(entry.name) || isNonPersonSpeakerName(entry.name))
   );
   if (!hasUnresolvedSelf) return null;
 
@@ -833,7 +852,7 @@ function backfillSelfSpeakerName() {
 
   let patched = 0;
   transcript.forEach((entry) => {
-    if (!entry || (!entry._selfUnresolved && !isSelfPlaceholderName(entry.name))) return;
+    if (!entry || (!entry._selfUnresolved && !isSelfPlaceholderName(entry.name) && !isNonPersonSpeakerName(entry.name))) return;
     entry.name = realName;
     entry._selfUnresolved = false;
     upsertCaptionBufferEvent({
@@ -1026,7 +1045,7 @@ safeStorageGet([
   hideUnconfirmedEnabled = res.hideUnconfirmedEnabled !== undefined ? !!res.hideUnconfirmedEnabled : true;
   meetCaptionOverlayHidden = res.meetCaptionOverlayHidden !== undefined
     ? !!res.meetCaptionOverlayHidden
-    : true;
+    : false;
   meetTryEnableCaptionsOnStart = res.meetTryEnableCaptionsOnStart !== undefined
     ? !!res.meetTryEnableCaptionsOnStart
     : false;
@@ -1036,6 +1055,8 @@ safeStorageGet([
     if (scopedIsRecording === true) {
       // Resume an in-progress recording (e.g. page reload mid-session).
       isRecording = true;
+      meetCaptionManualVisible = true;
+      meetCaptionEnabledByBootstrap = false;
       mtLog('storage-init:resume-scoped-recording');
     } else if (scopedIsRecording === undefined && res.isRecording === true) {
       // Migrate legacy global true state into scoped state.
@@ -1184,7 +1205,7 @@ if (isExtensionContextAvailable()) {
           meetCaptionBootstrapAttemptedForSession = false;
           clearMeetCaptionBootstrapTimer();
           if (PLATFORM === 'meet') {
-            removeMeetCaptionHideStyle();
+            syncMeetVisualCaptions();
             window.dispatchEvent(new Event('resize'));
           }
           if (PLATFORM === 'zoom') {
@@ -1235,6 +1256,7 @@ function saveTranscript() {
   storageStateTouchedLocally = true;
   clearTimeout(saveTimeout);
   mtLog('saveTranscript:scheduled', { transcriptLength: transcript.length });
+  syncMeetVisualCaptions();
   saveTimeout = setTimeout(() => {
     backfillSelfSpeakerName();
     mtLog('saveTranscript:flush', { transcriptLength: transcript.length });
@@ -1352,7 +1374,7 @@ function stopAndSave(reason) {
   currentSessionId = null;
   clearMeetCaptionBootstrapTimer();
   if (PLATFORM === 'meet') {
-    removeMeetCaptionHideStyle();
+    syncMeetVisualCaptions();
     window.dispatchEvent(new Event('resize'));
   }
   if (PLATFORM === 'zoom') {
@@ -1925,6 +1947,7 @@ const meetSourceStats = {
     captions: 0,
     meet_messages: 0,
     create_meeting_message: 0,
+    tactiq_message: 0,
     unknown: 0
   },
   lastSource: null,
@@ -1936,6 +1959,7 @@ function normalizeMeetSource(source) {
   if (source === 'captions') return 'captions';
   if (source === 'meet_messages') return 'meet_messages';
   if (source === 'create_meeting_message') return 'create_meeting_message';
+  if (source === 'tactiq-message') return 'tactiq_message';
   return 'unknown';
 }
 
@@ -1948,6 +1972,7 @@ function getMeetSourceStatsSnapshot() {
     captions: 0,
     meet_messages: 0,
     create_meeting_message: 0,
+    tactiq_message: 0,
     unknown: 0
   };
 
@@ -2000,13 +2025,22 @@ if (PLATFORM === 'meet') {
   document.addEventListener('__mt_meet_device', (evt) => {
     const { deviceId, deviceName } = evt.detail || {};
     if (deviceId && deviceName) {
-      meetDeviceMap[deviceId] = deviceName;
+      const cleanDeviceName = String(deviceName).replace(/\s+/g, ' ').trim();
+      if (isNonPersonSpeakerName(cleanDeviceName)) {
+        mtWarn('meet-device-map:skip-non-person-name', {
+          deviceId: deviceId,
+          deviceName: deviceName
+        });
+        return;
+      }
+
+      meetDeviceMap[deviceId] = cleanDeviceName;
       mtLog('meet-device-map:update', {
         deviceId: deviceId,
-        deviceName: deviceName,
+        deviceName: cleanDeviceName,
         totalKnownDevices: Object.keys(meetDeviceMap).length
       });
-      debugDevLog('meet-device', `${deviceId} → ${deviceName}`);
+      debugDevLog('meet-device', `${deviceId} -> ${cleanDeviceName}`);
     } else {
       mtWarn('meet-device-map:skip-invalid-event', evt.detail || {});
     }
@@ -2028,7 +2062,7 @@ if (PLATFORM === 'meet') {
     // Resolve display name from the device map (populated before first caption arrives)
     let speakerName = meetDeviceMap[deviceId] || '';
     if (!speakerName || !isRealName(speakerName)) {
-      speakerName = getUserRealName() || 'Speaker';
+      speakerName = getUserRealName() || discoverSelfNameFromTranscript() || 'Speaker';
     }
 
     let cleanText = sanitizeSpeechText(speakerName, text.trim());
@@ -2633,16 +2667,124 @@ if (PLATFORM === 'zoom') {
 //   recovery events below, not by forcing the captions UI state.
 //
 const MEET_CAPTION_HIDE_STYLE_ID = '__mt-caption-hide';
+const MEET_CAPTION_HIDDEN_ROOT_ATTR = 'data-mt-caption-hidden-root';
+const MEET_LIVE_CAPTION_OVERLAY_ID = '__mt-live-caption-overlay';
+const MEET_LIVE_CAPTION_STYLE_ID = '__mt-live-caption-style';
+const MEET_CAPTION_TEXT_SELECTOR = [
+  '.a4cQT',
+  'div[jsname="dsyhDe"]',
+  'div[jsname="dqMPrb"]',
+  'div[jsname="W297wb"]',
+  '.iY996',
+  '.V006ub',
+  '.nS7Zeb',
+  '.nMcdL',
+  '[jsname="YSZ4cc"]',
+  '[jsname="Vpvi7b"]'
+].join(', ');
 const MEET_CAPTION_LABEL_HINTS = [
   'caption', 'subtit', 'субтит', 'титр', 'napis', 'legenda', 'untertitel', 'sous-titre', '字幕'
 ];
 
+function clearMeetCaptionHiddenRoots() {
+  document.querySelectorAll(`[${MEET_CAPTION_HIDDEN_ROOT_ATTR}]`).forEach((el) => {
+    el.removeAttribute(MEET_CAPTION_HIDDEN_ROOT_ATTR);
+  });
+}
+
+function findMeetCaptionVisualRoot(startEl) {
+  if (!startEl) return null;
+  let best = null;
+  let el = startEl.nodeType === Node.ELEMENT_NODE ? startEl : startEl.parentElement;
+
+  while (el && el !== document.body && el !== document.documentElement) {
+    const rect = el.getBoundingClientRect();
+    const style = window.getComputedStyle(el);
+    const containsControls = !!el.querySelector('button, [role="button"], video');
+    const isKnownCaptionContainer =
+      el.matches(MEET_CAPTION_TEXT_SELECTOR) ||
+      normalizeMeetLabel(el.getAttribute('aria-label')).includes('субтит') ||
+      normalizeMeetLabel(el.getAttribute('aria-label')).includes('caption');
+    const plausibleCaptionBand =
+      rect.width >= Math.min(280, window.innerWidth * 0.28) &&
+      rect.height >= 24 &&
+      rect.height <= window.innerHeight * 0.45 &&
+      rect.top >= window.innerHeight * 0.25 &&
+      (!containsControls || isKnownCaptionContainer) &&
+      style.position !== 'fixed' &&
+      style.position !== 'sticky';
+
+    if (plausibleCaptionBand) {
+      best = el;
+    } else if (best && (containsControls || rect.height > window.innerHeight * 0.45)) {
+      break;
+    }
+
+    el = el.parentElement;
+  }
+
+  return best;
+}
+
+function markMeetCaptionHiddenRoots() {
+  const roots = new Set();
+
+  function rememberRoot(root) {
+    if (!root) return;
+    roots.add(root);
+  }
+
+  document.querySelectorAll(MEET_CAPTION_TEXT_SELECTOR).forEach((el) => {
+    const text = (el.textContent || '').replace(/\s+/g, ' ').trim();
+    const rect = el.getBoundingClientRect();
+    if (!text || rect.width <= 0 || rect.height <= 0) return;
+    rememberRoot(findMeetCaptionVisualRoot(el));
+  });
+
+  const recentTexts = transcript
+    .slice(-5)
+    .map((entry) => normalizeTranscriptTextForDedupe(entry && entry.text))
+    .filter((text) => text && text.length >= 12)
+    .map((text) => text.slice(0, Math.min(60, text.length)));
+
+  if (recentTexts.length) {
+    const candidates = document.querySelectorAll('div, span');
+    for (const el of candidates) {
+      const text = normalizeTranscriptTextForDedupe(el.textContent || '');
+      if (!text) continue;
+      if (!recentTexts.some((probe) => text.includes(probe))) continue;
+      rememberRoot(findMeetCaptionVisualRoot(el));
+      if (roots.size >= 6) break;
+    }
+  }
+
+  // If the hide style is already active, caption elements can measure as 0x0.
+  // Keep the previous marks instead of briefly flashing captions back on.
+  if (!roots.size) {
+    mtLog('caption-keeper:hidden-roots-marked', { count: 0, preserved: true });
+    return false;
+  }
+
+  clearMeetCaptionHiddenRoots();
+
+  roots.forEach((root) => {
+    root.setAttribute(MEET_CAPTION_HIDDEN_ROOT_ATTR, 'true');
+  });
+
+  mtLog('caption-keeper:hidden-roots-marked', {
+    count: roots.size
+  });
+  return true;
+}
+
 function injectMeetCaptionHideStyle() {
   let style = document.getElementById(MEET_CAPTION_HIDE_STYLE_ID);
-  if (style) return;
-  style = document.createElement('style');
-  style.id = MEET_CAPTION_HIDE_STYLE_ID;
+  markMeetCaptionHiddenRoots();
+  if (!style) {
+    style = document.createElement('style');
+    style.id = MEET_CAPTION_HIDE_STYLE_ID;
   style.textContent = `
+    [${MEET_CAPTION_HIDDEN_ROOT_ATTR}="true"],
     .a4cQT,
     div[jsname="dsyhDe"],
     div[jsname="dqMPrb"],
@@ -2658,18 +2800,127 @@ function injectMeetCaptionHideStyle() {
       display: none !important;
       visibility: hidden !important;
       pointer-events: none !important;
+      min-height: 0 !important;
+      max-height: 0 !important;
+      height: 0 !important;
+      margin: 0 !important;
+      padding: 0 !important;
+      overflow: hidden !important;
     }
   `;
-  (document.head || document.documentElement).appendChild(style);
-  mtLog('caption-keeper:hide-style-injected');
+    (document.head || document.documentElement).appendChild(style);
+    mtLog('caption-keeper:hide-style-injected');
+    return;
+  }
 }
 
 function removeMeetCaptionHideStyle() {
+  clearMeetCaptionHiddenRoots();
   const style = document.getElementById(MEET_CAPTION_HIDE_STYLE_ID);
   if (style) {
     style.remove();
     mtLog('caption-keeper:hide-style-removed');
   }
+}
+
+function getLatestMeetTranscriptEntry() {
+  for (let i = transcript.length - 1; i >= 0; i -= 1) {
+    const entry = transcript[i];
+    if (entry && entry.text && String(entry.text).trim()) return entry;
+  }
+  return null;
+}
+
+function ensureMeetLiveCaptionStyle() {
+  if (document.getElementById(MEET_LIVE_CAPTION_STYLE_ID)) return;
+  const style = document.createElement('style');
+  style.id = MEET_LIVE_CAPTION_STYLE_ID;
+  style.textContent = `
+    #${MEET_LIVE_CAPTION_OVERLAY_ID} {
+      position: fixed;
+      left: 50%;
+      bottom: 104px;
+      transform: translateX(-50%);
+      z-index: 2147483646;
+      width: min(900px, calc(100vw - 96px));
+      max-height: min(32vh, 260px);
+      overflow: hidden;
+      box-sizing: border-box;
+      padding: 12px 18px 14px;
+      border-radius: 18px;
+      background: rgba(19, 19, 20, 0.88);
+      color: #fff;
+      font-family: Google Sans, Roboto, Arial, sans-serif;
+      pointer-events: none;
+      box-shadow: 0 8px 30px rgba(0, 0, 0, 0.35);
+    }
+    #${MEET_LIVE_CAPTION_OVERLAY_ID} .mt-live-caption-speaker {
+      margin: 0 0 4px;
+      font-size: 14px;
+      font-weight: 700;
+      line-height: 1.2;
+      color: #c9b6ff;
+    }
+    #${MEET_LIVE_CAPTION_OVERLAY_ID} .mt-live-caption-text {
+      margin: 0;
+      font-size: clamp(20px, 2.2vw, 30px);
+      line-height: 1.28;
+      font-weight: 500;
+      white-space: normal;
+      overflow-wrap: anywhere;
+      display: -webkit-box;
+      -webkit-line-clamp: 4;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+    }
+  `;
+  (document.head || document.documentElement).appendChild(style);
+}
+
+function removeMeetLiveCaptionOverlay() {
+  const overlay = document.getElementById(MEET_LIVE_CAPTION_OVERLAY_ID);
+  if (overlay) overlay.remove();
+}
+
+function updateMeetLiveCaptionOverlay() {
+  if (PLATFORM !== 'meet' || !isRecording || !meetCaptionManualVisible) {
+    removeMeetLiveCaptionOverlay();
+    return;
+  }
+
+  const latest = getLatestMeetTranscriptEntry();
+  if (!latest) {
+    removeMeetLiveCaptionOverlay();
+    return;
+  }
+
+  ensureMeetLiveCaptionStyle();
+  let overlay = document.getElementById(MEET_LIVE_CAPTION_OVERLAY_ID);
+  if (!overlay) {
+    overlay = document.createElement('div');
+    overlay.id = MEET_LIVE_CAPTION_OVERLAY_ID;
+    overlay.setAttribute('aria-live', 'polite');
+    overlay.innerHTML = `
+      <div class="mt-live-caption-speaker"></div>
+      <div class="mt-live-caption-text"></div>
+    `;
+    document.documentElement.appendChild(overlay);
+  }
+
+  const speakerEl = overlay.querySelector('.mt-live-caption-speaker');
+  const textEl = overlay.querySelector('.mt-live-caption-text');
+  if (speakerEl) speakerEl.textContent = latest.name || 'Speaker';
+  if (textEl) textEl.textContent = latest.text || '';
+}
+
+function syncMeetVisualCaptions() {
+  if (PLATFORM !== 'meet') return;
+
+  // Match Tactiq's behavior: capture through RTC and leave Google's native
+  // captions UI entirely under user control. This keeps CC open/close seamless
+  // and avoids disturbing Meet's video layout.
+  removeMeetCaptionHideStyle();
+  removeMeetLiveCaptionOverlay();
 }
 
 function normalizeMeetLabel(value) {
@@ -2689,12 +2940,28 @@ function getMeetControlLabel(el) {
 
 function isMeetCaptionsToggleCandidate(el) {
   const label = getMeetControlLabel(el);
+  const text = normalizeMeetLabel(el && el.textContent);
+  const rect = el && el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+  const isSettings =
+    text.includes('settings') ||
+    label.includes('setting') ||
+    label.includes('настрой');
+  if (isSettings) return false;
+  if (text === 'closed_caption' || text === 'closed_captionclosed_caption') return true;
   if (!label) return false;
+  if (rect && rect.width <= 0 && rect.height <= 0) return false;
   return MEET_CAPTION_LABEL_HINTS.some(token => label.includes(token));
 }
 
 function getMeetCaptionsToggleButton() {
   const controls = document.querySelectorAll('button, [role="button"]');
+  for (const el of controls) {
+    const text = normalizeMeetLabel(el.textContent);
+    const rect = el.getBoundingClientRect();
+    if ((text === 'closed_caption' || text === 'closed_captionclosed_caption') && rect.width > 0 && rect.height > 0) {
+      return el;
+    }
+  }
   for (const el of controls) {
     if (isMeetCaptionsToggleCandidate(el)) return el;
   }
@@ -2709,6 +2976,22 @@ function isMeetCaptionsEnabled(btn) {
 
   const label = getMeetControlLabel(btn);
   if (!label) return null;
+
+  const saysTurnCaptionsOn =
+    (label.includes('turn on') || label.includes('enable') || label.includes('show')) &&
+    label.includes('caption');
+  const saysTurnCaptionsOff =
+    (label.includes('turn off') || label.includes('disable') || label.includes('hide')) &&
+    label.includes('caption');
+  const saysRuTurnCaptionsOn =
+    (label.includes('\u0432\u043a\u043b\u044e\u0447') || label.includes('\u043f\u043e\u043a\u0430\u0437')) &&
+    (label.includes('\u0441\u0443\u0431\u0442\u0438\u0442') || label.includes('\u0442\u0438\u0442\u0440'));
+  const saysRuTurnCaptionsOff =
+    (label.includes('\u043e\u0442\u043a\u043b\u044e\u0447') || label.includes('\u0441\u043a\u0440\u044b\u0442')) &&
+    (label.includes('\u0441\u0443\u0431\u0442\u0438\u0442') || label.includes('\u0442\u0438\u0442\u0440'));
+
+  if (saysTurnCaptionsOn || saysRuTurnCaptionsOn) return false;
+  if (saysTurnCaptionsOff || saysRuTurnCaptionsOff) return true;
 
   // When captions bar is extension-styled, Meet's label can become unreliable.
   // Avoid false toggles from label-only state.
@@ -2752,9 +3035,9 @@ function ensureMeetCaptionsEnabled(options = {}) {
 function tryEnableMeetCaptionsOnRecordingStart(trigger) {
   if (PLATFORM !== 'meet') return;
   if (!isRecording) return;
-  // Always bootstrap when overlay-hidden mode is on (capture depends on captions being enabled).
-  // Also bootstrap if the user explicitly requested it via the toggle.
-  if (!meetTryEnableCaptionsOnStart && !meetCaptionOverlayHidden) return;
+  // RTC capture is independent of the visible caption bar. Only touch Meet's
+  // native CC button if the user explicitly enabled this compatibility option.
+  if (!meetTryEnableCaptionsOnStart) return;
   if (meetCaptionBootstrapAttemptedForSession) return;
 
   meetCaptionBootstrapAttemptedForSession = true;
@@ -2766,7 +3049,8 @@ function tryEnableMeetCaptionsOnRecordingStart(trigger) {
   function finish(status, detail) {
     clearMeetCaptionBootstrapTimer();
     if ((status === 'already-enabled' || status === 'clicked-enable') && !meetCaptionManualVisible) {
-      injectMeetCaptionHideStyle();
+      meetCaptionManualVisible = true;
+      syncMeetVisualCaptions();
       window.dispatchEvent(new Event('resize'));
     }
     mtLog('caption-bootstrap:' + status, {
@@ -2850,20 +3134,10 @@ if (PLATFORM === 'meet') {
     if (!ccBtn || !isMeetCaptionsToggleCandidate(ccBtn)) return;
     if (suppressNextMeetCaptionToggleClick) return;
 
-    evt.stopImmediatePropagation();
-    evt.preventDefault();
-
+    // Let Google Meet own the visual CC toggle. Recording uses the RTC bridge,
+    // so closing captions must not stop the sidebar transcript.
     meetCaptionEnabledByBootstrap = false;
-    meetCaptionManualVisible = !meetCaptionManualVisible;
-
-    if (meetCaptionManualVisible) {
-      removeMeetCaptionHideStyle();
-      mtLog('caption-keeper:visual-toggle-show');
-    } else {
-      injectMeetCaptionHideStyle();
-      mtLog('caption-keeper:visual-toggle-hide');
-    }
-    window.dispatchEvent(new Event('resize'));
+    mtLog('caption-keeper:native-toggle-pass-through');
   }, true);
 
   document.addEventListener('__mt_meet_caption', () => {
@@ -2910,7 +3184,7 @@ if (PLATFORM === 'meet') {
     if (!isRecording) {
       // Remove the hide overlay when not recording so the user can use
       // native captions independently.
-      removeMeetCaptionHideStyle();
+      syncMeetVisualCaptions();
       return;
     }
 
@@ -2921,7 +3195,7 @@ if (PLATFORM === 'meet') {
       '[data-idom-class*="leave" i]'
     );
     if (!inMeeting) {
-      removeMeetCaptionHideStyle();
+      syncMeetVisualCaptions();
       return;
     }
 
@@ -2929,13 +3203,9 @@ if (PLATFORM === 'meet') {
     // do not force CSS visibility changes from the periodic loop.
     if (meetCaptionBootstrapTimer) return;
 
-    // meetCaptionManualVisible is a visual-only state. The click interceptor
-    // keeps Meet's server-side captions enabled so RTC capture continues.
-    if (!meetCaptionManualVisible) {
-      injectMeetCaptionHideStyle();
-    } else {
-      removeMeetCaptionHideStyle();
-    }
+    // meetCaptionManualVisible controls our own live caption overlay. Google's
+    // caption DOM stays hidden because it can freeze while RTC capture continues.
+    syncMeetVisualCaptions();
   }, 1500);
 
   setInterval(() => {
@@ -3431,7 +3701,7 @@ function injectWidget() {
       meetCaptionBootstrapAttemptedForSession = false;
       clearMeetCaptionBootstrapTimer();
       if (PLATFORM === 'meet') {
-        removeMeetCaptionHideStyle();
+        syncMeetVisualCaptions();
         window.dispatchEvent(new Event('resize'));
       }
       if (PLATFORM === 'zoom') {
@@ -3513,7 +3783,7 @@ function injectWidget() {
       const stats = getMeetSourceStatsSnapshot();
       const lastSwitchSec = stats.lastSwitchAgoMs == null ? '-' : Math.floor(stats.lastSwitchAgoMs / 1000) + 's';
       sourceStatsEl.textContent =
-        `src/min c:${stats.epm.captions} m:${stats.epm.meet_messages} f:${stats.epm.create_meeting_message} | last:${stats.lastSource || '-'} (${lastSwitchSec})`;
+        `src/min c:${stats.epm.captions} m:${stats.epm.meet_messages} f:${stats.epm.create_meeting_message} t:${stats.epm.tactiq_message} | last:${stats.lastSource || '-'} (${lastSwitchSec})`;
       sourceStatsEl.style.display = 'block';
     } else {
       sourceStatsEl.style.display = 'none';
@@ -3581,6 +3851,7 @@ function refreshUI() {
   } else {
     mtWarn('refreshUI:skip-no-widget-hook');
   }
+  syncMeetVisualCaptions();
 }
 
 // Inject the widget once the page is ready
