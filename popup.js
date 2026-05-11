@@ -258,17 +258,38 @@ document.addEventListener('DOMContentLoaded', () => {
     return list;
   }
 
+  function collectRecoverableSessionDrafts(storageSnapshot) {
+    const drafts = [];
+    Object.keys(storageSnapshot || {}).forEach((key) => {
+      if (!key.startsWith('activeSessionDraft:')) return;
+      const draft = storageSnapshot[key];
+      if (!draft || !draft.id || !Array.isArray(draft.transcript) || draft.transcript.length === 0) return;
+      drafts.push({ key, session: draft });
+    });
+    return drafts;
+  }
+
   function loadSessions() {
-    chrome.storage.local.get(['sessions', 'pendingFinalizedSession'], (res) => {
+    chrome.storage.local.get(null, (res) => {
       let sessions = res.sessions || [];
       const pending = res.pendingFinalizedSession;
+      const keysToClear = {};
 
       if (pending && pending.id && Array.isArray(pending.transcript)) {
         sessions = mergeSessionIntoList(sessions, pending);
-        chrome.storage.local.set({
-          sessions,
-          pendingFinalizedSession: null
+        keysToClear.pendingFinalizedSession = null;
+      }
+
+      collectRecoverableSessionDrafts(res).forEach(({ key, session }) => {
+        sessions = mergeSessionIntoList(sessions, {
+          ...session,
+          recoveredFrom: session.recoveredFrom || 'active-session-draft'
         });
+        keysToClear[key] = null;
+      });
+
+      if (Object.keys(keysToClear).length) {
+        chrome.storage.local.set({ sessions, ...keysToClear });
       }
 
       render(sessions);

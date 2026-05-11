@@ -893,6 +893,7 @@ function applySelfSpeakerNameBackfill(options) {
 const STORAGE_SCOPE = `${PLATFORM}:${getMeetingCode()}`;
 const RECORDING_STORAGE_KEY = `isRecording:${STORAGE_SCOPE}`;
 const TRANSCRIPT_STORAGE_KEY = `transcript:${STORAGE_SCOPE}`;
+const ACTIVE_SESSION_DRAFT_KEY = `activeSessionDraft:${STORAGE_SCOPE}`;
 const PENDING_FINALIZED_SESSION_KEY = 'pendingFinalizedSession';
 
 const DEV_DEBUG_ENABLED = (() => {
@@ -1000,10 +1001,14 @@ function setScopedRecordingState(nextIsRecording, nextTranscript) {
     transcriptLength: Array.isArray(nextTranscript) ? nextTranscript.length : -1
   });
   storageStateTouchedLocally = true;
-  safeStorageSet({
+  const payload = {
     [RECORDING_STORAGE_KEY]: nextIsRecording,
     [TRANSCRIPT_STORAGE_KEY]: nextTranscript
-  });
+  };
+  if (!nextIsRecording) {
+    payload[ACTIVE_SESSION_DRAFT_KEY] = null;
+  }
+  safeStorageSet(payload);
 }
 
 function mergeSessionIntoList(sessions, session) {
@@ -1302,12 +1307,67 @@ function saveTranscript() {
   saveTimeout = setTimeout(() => {
     backfillSelfSpeakerName();
     mtLog('saveTranscript:flush', { transcriptLength: transcript.length });
-    safeStorageSet({ [TRANSCRIPT_STORAGE_KEY]: transcript });
+    const payload = { [TRANSCRIPT_STORAGE_KEY]: transcript };
+    const activeDraft = buildSessionSnapshot('active-draft');
+    if (activeDraft) payload[ACTIVE_SESSION_DRAFT_KEY] = activeDraft;
+    safeStorageSet(payload);
     refreshUI();
   }, 500);
 }
 
 // ── Session Auto-Save ───────────────────────────────────────
+function buildSessionSnapshot(reason) {
+  if (transcript.length === 0) return null;
+
+  if (!currentSessionId) {
+    currentSessionId = Date.now().toString();
+  }
+
+  const merged = [];
+  transcript.forEach(item => {
+    const last = merged[merged.length - 1];
+    if (last && last.name === item.name) {
+      last.text += ' ' + item.text;
+    } else {
+      merged.push({ name: item.name, text: item.text });
+    }
+  });
+
+  const realMe = getUserRealName();
+  let uniqueSpeakers = [...new Set(transcript.map(t => {
+    if (realMe && (t.name === 'Вы' || t.name === 'You')) return realMe;
+    return t.name;
+  }))].filter(n => n);
+
+  if (uniqueSpeakers.length > 1) {
+    uniqueSpeakers = uniqueSpeakers.filter(n => n !== 'Вы' && n !== 'You' && n !== realMe);
+  }
+
+  uniqueSpeakers = uniqueSpeakers.slice(0, 3);
+  let participants = uniqueSpeakers.join(', ');
+  if (participants.length > 50) participants = participants.substring(0, 47) + '...';
+  if (!participants) participants = 'No speakers';
+
+  const startTime = parseInt(currentSessionId) || Date.now();
+  const d = new Date(startTime);
+  const dateStr = d.toLocaleDateString('ru-RU').replace(/\//g, '.');
+  const timeStr = d.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+
+  const rawTitle = getMeetingTitle();
+  const fullTitle = `MR-[${participants}] — ${rawTitle} — ${dateStr} ${timeStr}`;
+
+  return {
+    id: currentSessionId,
+    meetingCode: getMeetingCode(),
+    title: fullTitle,
+    date: new Date().toISOString(),
+    phraseCount: transcript.length,
+    transcript: merged,
+    debugStats: PLATFORM === 'meet' ? getMeetSourceStatsSnapshot() : undefined,
+    recoveredFrom: reason || undefined
+  };
+}
+
 function persistFinalizedSession(session, reason) {
   if (!session || !session.id) return;
 
@@ -1320,6 +1380,7 @@ function persistFinalizedSession(session, reason) {
     const sessions = mergeSessionIntoList(res.sessions, session);
     safeStorageSet({
       sessions: sessions,
+      [ACTIVE_SESSION_DRAFT_KEY]: null,
       [PENDING_FINALIZED_SESSION_KEY]: null
     }, () => {
       mtLog('finalizeSession:direct-storage-saved', {
@@ -1368,51 +1429,8 @@ function finalizeSession(reason) {
     return null;
   }
 
-  // Merge consecutive entries from same speaker for clean output
-  const merged = [];
-  transcript.forEach(item => {
-    const last = merged[merged.length - 1];
-    if (last && last.name === item.name) {
-      last.text += ' ' + item.text;
-    } else {
-      merged.push({ name: item.name, text: item.text });
-    }
-  });
-
-  const realMe = getUserRealName();
-  let uniqueSpeakers = [...new Set(transcript.map(t => {
-    if (realMe && (t.name === 'Вы' || t.name === 'You')) return realMe;
-    return t.name;
-  }))].filter(n => n);
-  
-  // If we have multiple speakers and one of them is "Вы"/"You" (or our real name), 
-  // prioritize others for the title but if it's the only speaker, keep it.
-  if (uniqueSpeakers.length > 1) {
-    uniqueSpeakers = uniqueSpeakers.filter(n => n !== 'Вы' && n !== 'You' && n !== realMe);
-  }
-  
-  uniqueSpeakers = uniqueSpeakers.slice(0, 3);
-  let participants = uniqueSpeakers.join(', ');
-  if (participants.length > 50) participants = participants.substring(0, 47) + '...';
-  if (!participants) participants = 'No speakers';
-
-  const startTime = parseInt(currentSessionId) || Date.now();
-  const d = new Date(startTime);
-  const dateStr = d.toLocaleDateString('ru-RU').replace(/\//g, '.');
-  const timeStr = d.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
-
-  const rawTitle = getMeetingTitle();
-  const fullTitle = `MR-[${participants}] — ${rawTitle} — ${dateStr} ${timeStr}`;
-
-  const session = {
-    id: currentSessionId,
-    meetingCode: getMeetingCode(),
-    title: fullTitle,
-    date: new Date().toISOString(),
-    phraseCount: transcript.length,
-    transcript: merged,
-    debugStats: PLATFORM === 'meet' ? getMeetSourceStatsSnapshot() : undefined
-  };
+  const session = buildSessionSnapshot(reason || 'finalized');
+  if (!session) return null;
   mtLog('finalizeSession:prepared', {
     sessionId: session.id,
     phraseCount: session.phraseCount,
@@ -1536,7 +1554,10 @@ setInterval(() => {
     if (transcript.length > 0 && Date.now() % 30000 < 3000) {
        mtLog('recording-heartbeat:persist-progress');
        compactDuplicateCaptionEntries(250);
-       safeStorageSet({ [TRANSCRIPT_STORAGE_KEY]: transcript });
+       const activeDraft = buildSessionSnapshot('heartbeat-draft');
+       const payload = { [TRANSCRIPT_STORAGE_KEY]: transcript };
+       if (activeDraft) payload[ACTIVE_SESSION_DRAFT_KEY] = activeDraft;
+       safeStorageSet(payload);
     }
 
     // 2. Check if meeting ended.
