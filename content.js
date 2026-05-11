@@ -2832,8 +2832,6 @@ if (PLATFORM === 'zoom') {
 //
 const MEET_CAPTION_HIDE_STYLE_ID = '__mt-caption-hide';
 const MEET_CAPTION_HIDDEN_ROOT_ATTR = 'data-mt-caption-hidden-root';
-const MEET_LIVE_CAPTION_OVERLAY_ID = '__mt-live-caption-overlay';
-const MEET_LIVE_CAPTION_STYLE_ID = '__mt-live-caption-style';
 const MEET_CAPTION_TEXT_SELECTOR = [
   '.a4cQT',
   'div[jsname="dsyhDe"]',
@@ -2987,124 +2985,6 @@ function removeMeetCaptionHideStyle() {
   }
 }
 
-function getRecentMeetTranscriptEntries(limit = 3) {
-  const entries = [];
-  for (let i = transcript.length - 1; i >= 0; i -= 1) {
-    const entry = transcript[i];
-    if (!entry || !entry.text || !String(entry.text).trim()) continue;
-    entries.unshift(entry);
-    if (entries.length >= limit) break;
-  }
-  return entries;
-}
-
-function ensureMeetLiveCaptionStyle() {
-  if (document.getElementById(MEET_LIVE_CAPTION_STYLE_ID)) return;
-  const style = document.createElement('style');
-  style.id = MEET_LIVE_CAPTION_STYLE_ID;
-  style.textContent = `
-    #${MEET_LIVE_CAPTION_OVERLAY_ID} {
-      position: fixed;
-      left: 50%;
-      bottom: 104px;
-      transform: translateX(-50%);
-      z-index: 2147483646;
-      width: min(980px, calc(100vw - 520px));
-      min-width: min(520px, calc(100vw - 96px));
-      max-height: min(32vh, 260px);
-      overflow: hidden;
-      box-sizing: border-box;
-      padding: 12px 18px 14px;
-      border-radius: 18px;
-      background: rgba(19, 19, 20, 0.88);
-      color: #fff;
-      font-family: Google Sans, Roboto, Arial, sans-serif;
-      pointer-events: none;
-      box-shadow: 0 8px 30px rgba(0, 0, 0, 0.35);
-    }
-    #${MEET_LIVE_CAPTION_OVERLAY_ID} .mt-live-caption-row {
-      margin: 0 0 8px;
-    }
-    #${MEET_LIVE_CAPTION_OVERLAY_ID} .mt-live-caption-row:last-child {
-      margin-bottom: 0;
-    }
-    #${MEET_LIVE_CAPTION_OVERLAY_ID} .mt-live-caption-speaker {
-      margin: 0 0 4px;
-      font-size: 14px;
-      font-weight: 700;
-      line-height: 1.2;
-      color: #c9b6ff;
-    }
-    #${MEET_LIVE_CAPTION_OVERLAY_ID} .mt-live-caption-text {
-      margin: 0;
-      font-size: 24px;
-      line-height: 1.28;
-      font-weight: 500;
-      white-space: normal;
-      overflow-wrap: break-word;
-      word-break: normal;
-      display: -webkit-box;
-      -webkit-line-clamp: 2;
-      -webkit-box-orient: vertical;
-      overflow: hidden;
-    }
-    @media (max-width: 1100px) {
-      #${MEET_LIVE_CAPTION_OVERLAY_ID} {
-        width: calc(100vw - 96px);
-      }
-      #${MEET_LIVE_CAPTION_OVERLAY_ID} .mt-live-caption-text {
-        font-size: 21px;
-      }
-    }
-  `;
-  (document.head || document.documentElement).appendChild(style);
-}
-
-function removeMeetLiveCaptionOverlay() {
-  const overlay = document.getElementById(MEET_LIVE_CAPTION_OVERLAY_ID);
-  if (overlay) overlay.remove();
-}
-
-function updateMeetLiveCaptionOverlay() {
-  if (PLATFORM !== 'meet' || !isRecording || !meetCaptionManualVisible) {
-    removeMeetLiveCaptionOverlay();
-    return;
-  }
-
-  const recentEntries = getRecentMeetTranscriptEntries(3);
-  if (!recentEntries.length) {
-    removeMeetLiveCaptionOverlay();
-    return;
-  }
-
-  ensureMeetLiveCaptionStyle();
-  let overlay = document.getElementById(MEET_LIVE_CAPTION_OVERLAY_ID);
-  if (!overlay) {
-    overlay = document.createElement('div');
-    overlay.id = MEET_LIVE_CAPTION_OVERLAY_ID;
-    overlay.setAttribute('aria-live', 'polite');
-    document.documentElement.appendChild(overlay);
-  }
-
-  overlay.textContent = '';
-  recentEntries.forEach((entry) => {
-    const row = document.createElement('div');
-    row.className = 'mt-live-caption-row';
-
-    const speakerEl = document.createElement('div');
-    speakerEl.className = 'mt-live-caption-speaker';
-    speakerEl.textContent = entry.name || 'Speaker';
-
-    const textEl = document.createElement('div');
-    textEl.className = 'mt-live-caption-text';
-    textEl.textContent = entry.text || '';
-
-    row.appendChild(speakerEl);
-    row.appendChild(textEl);
-    overlay.appendChild(row);
-  });
-}
-
 function syncMeetVisualCaptions() {
   if (PLATFORM !== 'meet') return;
 
@@ -3112,7 +2992,6 @@ function syncMeetVisualCaptions() {
   // captions UI entirely under user control. This keeps CC open/close seamless
   // and avoids disturbing Meet's video layout.
   removeMeetCaptionHideStyle();
-  updateMeetLiveCaptionOverlay();
 }
 
 function normalizeMeetLabel(value) {
