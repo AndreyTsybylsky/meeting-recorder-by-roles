@@ -222,6 +222,8 @@ let zoomLastEnsureTranscriptionAt = 0;
 // before the meeting UI finishes rendering (Teams SPA issue).
 let meetingContainerEverSeen = false;
 let meetingUiMissingStreak = 0;
+let stopAndSaveInProgress = false;
+const finalizedSessionIds = new Set();
 let lastTranscriptStorageWriteAt = 0;
 
 const MAX_STREAM_BUFFER_ITEMS = 500;
@@ -891,6 +893,7 @@ function applySelfSpeakerNameBackfill(options) {
 const STORAGE_SCOPE = `${PLATFORM}:${getMeetingCode()}`;
 const RECORDING_STORAGE_KEY = `isRecording:${STORAGE_SCOPE}`;
 const TRANSCRIPT_STORAGE_KEY = `transcript:${STORAGE_SCOPE}`;
+const PENDING_FINALIZED_SESSION_KEY = 'pendingFinalizedSession';
 
 const DEV_DEBUG_ENABLED = (() => {
   try {
@@ -1003,6 +1006,41 @@ function setScopedRecordingState(nextIsRecording, nextTranscript) {
   });
 }
 
+function mergeSessionIntoList(sessions, session) {
+  const list = Array.isArray(sessions) ? sessions.slice() : [];
+  if (!session || !session.id) return list;
+
+  const idx = list.findIndex(s => s && s.id === session.id);
+  if (idx >= 0) list[idx] = session;
+  else list.unshift(session);
+  if (list.length > 50) list.length = 50;
+  return list;
+}
+
+function recoverPendingFinalizedSession(pendingSession, source) {
+  if (!pendingSession || !pendingSession.id || !Array.isArray(pendingSession.transcript)) return;
+
+  mtWarn('pending-session:recover-start', {
+    source: source || 'unknown',
+    sessionId: pendingSession.id,
+    phraseCount: pendingSession.phraseCount
+  });
+
+  safeStorageGet(['sessions'], (res) => {
+    const sessions = mergeSessionIntoList(res.sessions, pendingSession);
+    safeStorageSet({
+      sessions: sessions,
+      [PENDING_FINALIZED_SESSION_KEY]: null
+    }, () => {
+      mtWarn('pending-session:recover-saved', {
+        source: source || 'unknown',
+        sessionId: pendingSession.id,
+        totalSessions: sessions.length
+      });
+    });
+  });
+}
+
 // ── Persistence ─────────────────────────────────────────────
 safeStorageGet([
   RECORDING_STORAGE_KEY,
@@ -1015,7 +1053,8 @@ safeStorageGet([
   'meetTryEnableCaptionsOnStart',
   'qualityFusionEnabled',
   'minCaptionChars',
-  'hideUnconfirmedEnabled'
+  'hideUnconfirmedEnabled',
+  PENDING_FINALIZED_SESSION_KEY
 ], (res) => {
   const scopedIsRecording = res[RECORDING_STORAGE_KEY];
   const scopedTranscript = res[TRANSCRIPT_STORAGE_KEY];
@@ -1031,8 +1070,11 @@ safeStorageGet([
     minCaptionChars: res.minCaptionChars,
     hideUnconfirmedEnabled: res.hideUnconfirmedEnabled,
     meetCaptionOverlayHidden: res.meetCaptionOverlayHidden,
-    meetTryEnableCaptionsOnStart: res.meetTryEnableCaptionsOnStart
+    meetTryEnableCaptionsOnStart: res.meetTryEnableCaptionsOnStart,
+    hasPendingFinalizedSession: !!res[PENDING_FINALIZED_SESSION_KEY]
   });
+
+  recoverPendingFinalizedSession(res[PENDING_FINALIZED_SESSION_KEY], 'content-storage-init');
 
   // Resolve autoRecordEnabled setting (default true if never set)
   autoRecordEnabled = res.autoRecordEnabled !== undefined ? !!res.autoRecordEnabled : true;
@@ -1198,7 +1240,7 @@ if (isExtensionContextAvailable()) {
           }
         } else {
           mtWarn('recording-stop:manual-toggle', { transcriptLength: transcript.length });
-          finalizeSession();
+          finalizeSession('manual-toggle-message');
           replaceTranscript([]);
           meetCaptionManualVisible = false;
           meetCaptionEnabledByBootstrap = false;
@@ -1266,20 +1308,64 @@ function saveTranscript() {
 }
 
 // ── Session Auto-Save ───────────────────────────────────────
-function finalizeSession() {
+function persistFinalizedSession(session, reason) {
+  if (!session || !session.id) return;
+
+  // Single-key backup is intentionally written before async merge/message paths.
+  // On macOS Chrome can tear down Meet/Teams tabs before callbacks run; popup/content
+  // recover this key into the regular history on the next extension wake-up.
+  safeStorageSet({ [PENDING_FINALIZED_SESSION_KEY]: session });
+
+  safeStorageGet(['sessions'], (res) => {
+    const sessions = mergeSessionIntoList(res.sessions, session);
+    safeStorageSet({
+      sessions: sessions,
+      [PENDING_FINALIZED_SESSION_KEY]: null
+    }, () => {
+      mtLog('finalizeSession:direct-storage-saved', {
+        reason: reason || 'unspecified',
+        totalSessions: sessions.length,
+        sessionId: session.id
+      });
+    });
+  });
+
+  // Keep background save for existing behavior; direct storage above is the reliable path.
+  safeSendMessage({ type: 'SAVE_SESSION', session }, (ok) => {
+    if (ok) {
+      mtLog('finalizeSession:save-via-background-ok', { sessionId: session.id });
+      return;
+    }
+
+    mtWarn('finalizeSession:save-via-background-failed:direct-storage-already-requested', {
+      sessionId: session.id
+    });
+  });
+}
+
+function finalizeSession(reason) {
   backfillSelfSpeakerName();
   compactDuplicateCaptionEntries();
   mtLog('finalizeSession:start', {
     transcriptLength: transcript.length,
-    currentSessionId: currentSessionId
+    currentSessionId: currentSessionId,
+    reason: reason || 'unspecified'
   });
   if (transcript.length === 0) {
     mtWarn('finalizeSession:skip-empty-transcript');
-    return;
+    return null;
   }
   
   if (!currentSessionId) {
     currentSessionId = Date.now().toString();
+  }
+
+  if (finalizedSessionIds.has(currentSessionId)) {
+    mtWarn('finalizeSession:skip-already-finalized', {
+      sessionId: currentSessionId,
+      reason: reason || 'unspecified'
+    });
+    return null;
   }
 
   // Merge consecutive entries from same speaker for clean output
@@ -1334,26 +1420,10 @@ function finalizeSession() {
     title: session.title,
     sourceStats: session.debugStats
   });
-  
-  // Send to background for persistent storage, fallback to local list if messaging fails.
-  safeSendMessage({ type: 'SAVE_SESSION', session }, (ok) => {
-    if (ok) {
-      mtLog('finalizeSession:save-via-background-ok', { sessionId: session.id });
-      return;
-    }
 
-    mtWarn('finalizeSession:save-via-background-failed:fallback-storage', { sessionId: session.id });
-
-    safeStorageGet(['sessions'], (res) => {
-      const sessions = res.sessions || [];
-      const idx = sessions.findIndex(s => s.id === session.id);
-      if (idx >= 0) sessions[idx] = session;
-      else sessions.unshift(session);
-      if (sessions.length > 50) sessions.length = 50;
-      safeStorageSet({ sessions });
-      mtLog('finalizeSession:fallback-saved', { totalSessions: sessions.length, sessionId: session.id });
-    });
-  });
+  finalizedSessionIds.add(session.id);
+  persistFinalizedSession(session, reason);
+  return session;
 }
 
 // Auto-save when leaving the page or meeting ends
@@ -1368,7 +1438,12 @@ function stopAndSave(reason) {
     mtWarn('stopAndSave:skip-not-recording', { reason: reason || 'unspecified' });
     return;
   }
-  finalizeSession();
+  if (stopAndSaveInProgress) {
+    mtWarn('stopAndSave:skip-already-in-progress', { reason: reason || 'unspecified' });
+    return;
+  }
+  stopAndSaveInProgress = true;
+  finalizeSession(reason || 'stop-and-save');
   isRecording = false;
   setScopedRecordingState(false, []);
   currentSessionId = null;
@@ -1385,6 +1460,74 @@ function stopAndSave(reason) {
 }
 
 window.addEventListener('beforeunload', () => stopAndSave('beforeunload'));
+window.addEventListener('pagehide', () => stopAndSave('pagehide'));
+
+function getActionLabelForElement(el) {
+  if (!el) return '';
+  const parts = [
+    el.getAttribute && el.getAttribute('aria-label'),
+    el.getAttribute && el.getAttribute('title'),
+    el.getAttribute && el.getAttribute('data-tooltip'),
+    el.getAttribute && el.getAttribute('data-tid'),
+    el.getAttribute && el.getAttribute('data-testid'),
+    el.getAttribute && el.getAttribute('data-idom-class'),
+    el.textContent
+  ];
+  return parts.filter(Boolean).join(' ').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+function isLikelyMeetingLeaveTarget(target) {
+  if (!target || !target.closest) return false;
+
+  const control = target.closest('button, [role="button"], [data-tid], [data-testid], [data-tooltip], [data-idom-class]');
+  if (!control) return false;
+
+  const label = getActionLabelForElement(control);
+  if (!label) return false;
+
+  const isLeaveAction =
+    label.includes('hangup') ||
+    label.includes('hang up') ||
+    label.includes('leave call') ||
+    label.includes('leave meeting') ||
+    label.includes('end call') ||
+    label.includes('end meeting') ||
+    label.includes('disconnect') ||
+    label.includes('покинуть') ||
+    label.includes('выйти') ||
+    label.includes('завершить') ||
+    (label.includes('звонок') && label.includes('заверш')) ||
+    (label.includes('встреч') && (label.includes('покин') || label.includes('заверш')));
+
+  if (!isLeaveAction) return false;
+
+  const isNonLeaveAction =
+    label.includes('stop sharing') ||
+    label.includes('остановить показ') ||
+    label.includes('stop presenting') ||
+    label.includes('mute') ||
+    label.includes('unmute') ||
+    label.includes('camera') ||
+    label.includes('video');
+
+  return !isNonLeaveAction;
+}
+
+function handlePotentialLeaveAction(evt) {
+  if (!isRecording) return;
+  if (PLATFORM !== 'meet' && PLATFORM !== 'teams') return;
+  if (!isLikelyMeetingLeaveTarget(evt.target)) return;
+
+  mtWarn('leave-control:stop-before-click-completes', {
+    type: evt.type,
+    platform: PLATFORM,
+    transcriptLength: transcript.length
+  });
+  stopAndSave('leave-control-' + evt.type);
+}
+
+document.addEventListener('pointerdown', handlePotentialLeaveAction, true);
+document.addEventListener('click', handlePotentialLeaveAction, true);
 
 // Monitor if the meeting is still active
 setInterval(() => {
@@ -2823,12 +2966,15 @@ function removeMeetCaptionHideStyle() {
   }
 }
 
-function getLatestMeetTranscriptEntry() {
+function getRecentMeetTranscriptEntries(limit = 3) {
+  const entries = [];
   for (let i = transcript.length - 1; i >= 0; i -= 1) {
     const entry = transcript[i];
-    if (entry && entry.text && String(entry.text).trim()) return entry;
+    if (!entry || !entry.text || !String(entry.text).trim()) continue;
+    entries.unshift(entry);
+    if (entries.length >= limit) break;
   }
-  return null;
+  return entries;
 }
 
 function ensureMeetLiveCaptionStyle() {
@@ -2842,7 +2988,8 @@ function ensureMeetLiveCaptionStyle() {
       bottom: 104px;
       transform: translateX(-50%);
       z-index: 2147483646;
-      width: min(900px, calc(100vw - 96px));
+      width: min(980px, calc(100vw - 520px));
+      min-width: min(520px, calc(100vw - 96px));
       max-height: min(32vh, 260px);
       overflow: hidden;
       box-sizing: border-box;
@@ -2854,6 +3001,12 @@ function ensureMeetLiveCaptionStyle() {
       pointer-events: none;
       box-shadow: 0 8px 30px rgba(0, 0, 0, 0.35);
     }
+    #${MEET_LIVE_CAPTION_OVERLAY_ID} .mt-live-caption-row {
+      margin: 0 0 8px;
+    }
+    #${MEET_LIVE_CAPTION_OVERLAY_ID} .mt-live-caption-row:last-child {
+      margin-bottom: 0;
+    }
     #${MEET_LIVE_CAPTION_OVERLAY_ID} .mt-live-caption-speaker {
       margin: 0 0 4px;
       font-size: 14px;
@@ -2863,15 +3016,24 @@ function ensureMeetLiveCaptionStyle() {
     }
     #${MEET_LIVE_CAPTION_OVERLAY_ID} .mt-live-caption-text {
       margin: 0;
-      font-size: clamp(20px, 2.2vw, 30px);
+      font-size: 24px;
       line-height: 1.28;
       font-weight: 500;
       white-space: normal;
-      overflow-wrap: anywhere;
+      overflow-wrap: break-word;
+      word-break: normal;
       display: -webkit-box;
-      -webkit-line-clamp: 4;
+      -webkit-line-clamp: 2;
       -webkit-box-orient: vertical;
       overflow: hidden;
+    }
+    @media (max-width: 1100px) {
+      #${MEET_LIVE_CAPTION_OVERLAY_ID} {
+        width: calc(100vw - 96px);
+      }
+      #${MEET_LIVE_CAPTION_OVERLAY_ID} .mt-live-caption-text {
+        font-size: 21px;
+      }
     }
   `;
   (document.head || document.documentElement).appendChild(style);
@@ -2888,8 +3050,8 @@ function updateMeetLiveCaptionOverlay() {
     return;
   }
 
-  const latest = getLatestMeetTranscriptEntry();
-  if (!latest) {
+  const recentEntries = getRecentMeetTranscriptEntries(3);
+  if (!recentEntries.length) {
     removeMeetLiveCaptionOverlay();
     return;
   }
@@ -2900,17 +3062,26 @@ function updateMeetLiveCaptionOverlay() {
     overlay = document.createElement('div');
     overlay.id = MEET_LIVE_CAPTION_OVERLAY_ID;
     overlay.setAttribute('aria-live', 'polite');
-    overlay.innerHTML = `
-      <div class="mt-live-caption-speaker"></div>
-      <div class="mt-live-caption-text"></div>
-    `;
     document.documentElement.appendChild(overlay);
   }
 
-  const speakerEl = overlay.querySelector('.mt-live-caption-speaker');
-  const textEl = overlay.querySelector('.mt-live-caption-text');
-  if (speakerEl) speakerEl.textContent = latest.name || 'Speaker';
-  if (textEl) textEl.textContent = latest.text || '';
+  overlay.textContent = '';
+  recentEntries.forEach((entry) => {
+    const row = document.createElement('div');
+    row.className = 'mt-live-caption-row';
+
+    const speakerEl = document.createElement('div');
+    speakerEl.className = 'mt-live-caption-speaker';
+    speakerEl.textContent = entry.name || 'Speaker';
+
+    const textEl = document.createElement('div');
+    textEl.className = 'mt-live-caption-text';
+    textEl.textContent = entry.text || '';
+
+    row.appendChild(speakerEl);
+    row.appendChild(textEl);
+    overlay.appendChild(row);
+  });
 }
 
 function syncMeetVisualCaptions() {
@@ -2920,7 +3091,7 @@ function syncMeetVisualCaptions() {
   // captions UI entirely under user control. This keeps CC open/close seamless
   // and avoids disturbing Meet's video layout.
   removeMeetCaptionHideStyle();
-  removeMeetLiveCaptionOverlay();
+  updateMeetLiveCaptionOverlay();
 }
 
 function normalizeMeetLabel(value) {
@@ -3693,7 +3864,7 @@ function injectWidget() {
       debugDevLog('record-start', `sessionId=${currentSessionId}`);
     } else {
       // End of session - finalize and save to history
-      finalizeSession();
+      finalizeSession('widget-toggle');
       // We clear the active transcript after saving to history
       transcript = [];
       meetCaptionManualVisible = false;

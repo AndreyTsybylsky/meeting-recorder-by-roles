@@ -247,9 +247,30 @@ document.addEventListener('DOMContentLoaded', () => {
 
   loadSessions();
 
+  function mergeSessionIntoList(sessions, session) {
+    const list = Array.isArray(sessions) ? sessions.slice() : [];
+    if (!session || !session.id) return list;
+
+    const idx = list.findIndex(s => s && s.id === session.id);
+    if (idx >= 0) list[idx] = session;
+    else list.unshift(session);
+    if (list.length > 50) list.length = 50;
+    return list;
+  }
+
   function loadSessions() {
-    chrome.storage.local.get(['sessions'], (res) => {
-      const sessions = res.sessions || [];
+    chrome.storage.local.get(['sessions', 'pendingFinalizedSession'], (res) => {
+      let sessions = res.sessions || [];
+      const pending = res.pendingFinalizedSession;
+
+      if (pending && pending.id && Array.isArray(pending.transcript)) {
+        sessions = mergeSessionIntoList(sessions, pending);
+        chrome.storage.local.set({
+          sessions,
+          pendingFinalizedSession: null
+        });
+      }
+
       render(sessions);
     });
   }
