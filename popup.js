@@ -192,6 +192,10 @@ document.addEventListener('DOMContentLoaded', () => {
 
   updateAttachHintText();
 
+  emailToInput.addEventListener('input', () => {
+    chrome.storage.local.set({ savedEmailTo: emailToInput.value.trim() });
+  });
+
   emailCancel.addEventListener('click', () => {
     emailOverlay.classList.remove('show');
     pendingEmailSession = null;
@@ -392,7 +396,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
   function openEmailModal(s) {
     pendingEmailSession = s;
-    emailToInput.value = 'andrey.tsybulski@innowise.com';
+    chrome.storage.local.get(['savedEmailTo'], (res) => {
+      emailToInput.value = res.savedEmailTo || 'andrey.tsybulski@innowise.com';
+    });
     emailCommentInput.value = '';
     resetCopyButtonState();
     hideToast();
