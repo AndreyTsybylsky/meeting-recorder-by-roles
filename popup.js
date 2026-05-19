@@ -238,9 +238,19 @@ document.addEventListener('DOMContentLoaded', () => {
 
   emailSendBtn.addEventListener('click', () => {
     if (!pendingEmailSession) return;
-    const to = emailToInput.value.trim();
+    const { recipients, invalidRecipients } = parseEmailRecipients(emailToInput.value);
+    if (!recipients.length) {
+      showToast('Укажите хотя бы один корректный e-mail', true);
+      emailToInput.focus();
+      return;
+    }
+    if (invalidRecipients.length) {
+      showToast(`Проверьте e-mail: ${invalidRecipients[0]}`, true);
+      emailToInput.focus();
+      return;
+    }
     const comment = emailCommentInput.value.trim();
-    sendSessionByEmail(pendingEmailSession, to, comment);
+    sendSessionByEmail(pendingEmailSession, recipients, comment);
     emailOverlay.classList.remove('show');
     pendingEmailSession = null;
   });
@@ -409,7 +419,7 @@ document.addEventListener('DOMContentLoaded', () => {
     emailCommentInput.focus();
   }
 
-  async function sendSessionByEmail(s, to, comment) {
+  async function sendSessionByEmail(s, recipients, comment) {
     const date = new Date(s.date);
     const dateStr = date.toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit', year: 'numeric' });
     const timeStr = date.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
@@ -433,6 +443,7 @@ document.addEventListener('DOMContentLoaded', () => {
     if (comment) body += `${comment}\n\n`;
     body += `Встреча: ${title}\nДата: ${dateStr} в ${timeStr}\nУчастников: ${speakerCount} · Реплик: ${s.transcript.length}\n\nТранскрипт во вложении: ${fileName}`;
 
+    const to = recipients.join(',');
     const gmailUrl = `https://mail.google.com/mail/?view=cm&to=${encodeURIComponent(to)}&su=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
     requestOpenUrlViaBackground(gmailUrl);
 
@@ -454,6 +465,22 @@ document.addEventListener('DOMContentLoaded', () => {
       }
     }
 
+  }
+
+  function parseEmailRecipients(value) {
+    const items = String(value || '')
+      .split(/[\s,;]+/)
+      .map(item => item.trim())
+      .filter(Boolean);
+
+    return {
+      recipients: items.filter(isValidEmailRecipient),
+      invalidRecipients: items.filter(item => !isValidEmailRecipient(item))
+    };
+  }
+
+  function isValidEmailRecipient(value) {
+    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
   }
 
   function deleteSession(sessionId) {
